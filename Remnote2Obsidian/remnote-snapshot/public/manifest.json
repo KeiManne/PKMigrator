@@ -1,0 +1,26 @@
+{
+  "manifestVersion": 1,
+  "id": "pkmigrator_remnote_snapshot",
+  "name": "PKMigrator Read-Only Snapshot",
+  "author": "PKMigrator contributors",
+  "repoUrl": "https://github.com/KeiManne/PKMigrator",
+  "version": {
+    "major": 0,
+    "minor": 1,
+    "patch": 0
+  },
+  "theme": [],
+  "enableOnMobile": false,
+  "description": "Downloads a local, read-only migration snapshot of portal and automatic-view state.",
+  "requestNative": false,
+  "requiredScopes": [
+    {
+      "type": "All",
+      "level": "Read"
+    },
+    {
+      "type": "KnowledgeBaseInfo",
+      "level": "Read"
+    }
+  ]
+}

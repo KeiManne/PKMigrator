@@ -3,8 +3,8 @@
 
 This module consumes ``remnote_export.py`` schema-version-1 manifests. It does
 not turn portal copies into evidence records: one Markdown search record is
-written per ``source_map`` Rem ID, with every readable appearance retained as
-metadata for scoped gathering and citation.
+written per knowledge-base ID plus Rem ID, with every readable appearance
+retained as metadata for scoped gathering and citation.
 
 Privacy propagation here is an advisory dependency calculation for testing and
 review. It is not a production serving or access-control implementation.
@@ -22,6 +22,9 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable
 
@@ -30,7 +33,9 @@ DEFAULT_MAX_ASSETS = 25
 DEFAULT_MAX_ASSET_BYTES = 12 * 1024 * 1024
 DEFAULT_TIMEOUT_SECONDS = 10.0
 DEFAULT_RETRIES = 1
+DEFAULT_WORKERS = 6
 ASSET_PREFIX = ("Attachments", "RemNote")
+MAX_EXPORT_JSON_BYTES = 256 * 1024 * 1024
 
 
 class SupportError(ValueError):
@@ -41,14 +46,14 @@ class AssetValidationError(SupportError):
     """Raised for a deterministic media-validation failure."""
 
 
-def load_manifest(path: Path) -> dict[str, Any]:
+def load_manifest(path: Path, *, require_source_map: bool = True) -> dict[str, Any]:
     try:
         manifest = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise SupportError(f"could not read manifest: {exc}") from exc
-    if not isinstance(manifest, dict) or manifest.get("schema_version") != 1:
-        raise SupportError("expected a schema-version-1 manifest object")
-    if not isinstance(manifest.get("source_map"), dict):
+    if not isinstance(manifest, dict) or manifest.get("schema_version") not in {1, 2}:
+        raise SupportError("expected a supported schema-version-1 or -2 manifest object")
+    if require_source_map and not isinstance(manifest.get("source_map"), dict):
         raise SupportError("manifest source_map must be an object")
     if not isinstance(manifest.get("assets", {}), dict):
         raise SupportError("manifest assets must be an object")
@@ -58,7 +63,18 @@ def load_manifest(path: Path) -> dict[str, Any]:
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    path.write_text(data, encoding="utf-8")
+    temporary_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, prefix=".pilot-report-", delete=False
+        ) as handle:
+            handle.write(data)
+            temporary_name = handle.name
+        os.replace(temporary_name, path)
+        temporary_name = None
+    finally:
+        if temporary_name:
+            Path(temporary_name).unlink(missing_ok=True)
 
 
 def _inside(path: Path, root: Path) -> bool:
@@ -102,7 +118,7 @@ def _validate_deterministic_asset_path(url: str, relative: str) -> None:
 
 
 def sniff_image(data: bytes) -> tuple[str, set[str]]:
-    """Return a conservative image format and its accepted content types."""
+    """Return a conservatively recognized raster format and MIME types."""
     if data.startswith(b"\x89PNG\r\n\x1a\n"):
         return "png", {"image/png"}
     if data.startswith(b"\xff\xd8\xff"):
@@ -119,11 +135,12 @@ def sniff_image(data: bytes) -> tuple[str, set[str]]:
         return "ico", {"image/x-icon", "image/vnd.microsoft.icon"}
     if len(data) >= 12 and data[4:8] == b"ftyp" and data[8:12] in {b"avif", b"avis"}:
         return "avif", {"image/avif"}
-    raise AssetValidationError("payload has no supported raster-image signature")
+    raise AssetValidationError("payload has no supported raster signature")
 
 
 def _read_bounded(response: Any, max_bytes: int) -> bytes:
     raw_length = response.headers.get("Content-Length") if response.headers else None
+    content_length: int | None = None
     if raw_length:
         try:
             content_length = int(raw_length)
@@ -141,6 +158,10 @@ def _read_bounded(response: Any, max_bytes: int) -> bytes:
         total += len(chunk)
         if total > max_bytes:
             raise AssetValidationError(f"asset exceeds {max_bytes} byte limit")
+    if content_length is not None and total != content_length:
+        raise AssetValidationError(
+            f"response body length {total} does not match Content-Length {content_length}"
+        )
     return b"".join(chunks)
 
 
@@ -201,6 +222,21 @@ def _download_one(
     }
 
 
+def _inspect_local_asset(path: Path, *, max_bytes: int) -> dict[str, Any]:
+    if not path.is_file():
+        raise AssetValidationError("declared local asset is missing")
+    size = path.stat().st_size
+    if size > max_bytes:
+        raise AssetValidationError(f"local asset exceeds {max_bytes} byte limit")
+    data = path.read_bytes()
+    image_format, _ = sniff_image(data)
+    return {
+        "bytes": size,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "format": image_format,
+    }
+
+
 def download_assets(
     manifest: dict[str, Any],
     output_root: Path,
@@ -211,9 +247,16 @@ def download_assets(
     retries: int = DEFAULT_RETRIES,
     retry_delay_seconds: float = 0.05,
     opener: Callable[..., Any] = urllib.request.urlopen,
+    workers: int = DEFAULT_WORKERS,
+    prior_report: dict[str, Any] | None = None,
+    checkpoint_path: Path | None = None,
+    checkpoint_every: int = 25,
 ) -> dict[str, Any]:
-    """Download a bounded asset set and return every success or failure."""
-    if max_assets < 0 or max_bytes < 1 or timeout_seconds <= 0 or retries < 0:
+    """Download bounded assets with hash-verified resume and partial checkpoints."""
+    if (
+        max_assets < 0 or max_bytes < 1 or timeout_seconds <= 0 or retries < 0
+        or workers < 1 or checkpoint_every < 1
+    ):
         raise SupportError("asset bounds must be non-negative and non-zero where applicable")
     assets = manifest.get("assets", {})
     if not isinstance(assets, dict):
@@ -225,10 +268,44 @@ def download_assets(
             "max_bytes_each": max_bytes,
             "timeout_seconds": timeout_seconds,
             "retries": retries,
+            "workers": workers,
         },
         "downloaded": [],
+        "reused": [],
         "failures": [],
     }
+    trusted_hashes: dict[str, str] = {}
+    if prior_report is not None:
+        if not isinstance(prior_report, dict):
+            raise SupportError("prior download report must be an object")
+        for section in ("downloaded", "reused"):
+            items = prior_report.get(section, [])
+            if not isinstance(items, list):
+                raise SupportError(f"prior download report {section} must be a list")
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                relative = item.get("relative_path")
+                digest = item.get("sha256")
+                if isinstance(relative, str) and re.fullmatch(r"[0-9a-f]{64}", str(digest)):
+                    trusted_hashes[relative] = str(digest)
+
+    def update_counts() -> None:
+        report["counts"] = {
+            "declared": len(assets),
+            "downloaded": len(report["downloaded"]),
+            "reused": len(report["reused"]),
+            "failed": len(report["failures"]),
+        }
+
+    def checkpoint() -> None:
+        update_counts()
+        if checkpoint_path is not None:
+            partial = dict(report)
+            partial["status"] = "in_progress"
+            write_json(checkpoint_path, partial)
+
+    jobs: list[tuple[str, dict[str, Any], str, Path]] = []
     for ordinal, url in enumerate(sorted(assets)):
         asset = assets[url]
         if ordinal >= max_assets:
@@ -245,6 +322,25 @@ def download_assets(
         except SupportError as exc:
             report["failures"].append({"url": url, "code": "unsafe_asset", "message": str(exc)})
             continue
+        if destination.exists() and relative in trusted_hashes:
+            try:
+                item = _inspect_local_asset(destination, max_bytes=max_bytes)
+                if item["sha256"] != trusted_hashes[relative]:
+                    raise AssetValidationError("local asset hash does not match the trusted prior report")
+                item.update({
+                    "url": url,
+                    "relative_path": relative,
+                    "attempts": 0,
+                    "occurrence_count": len(asset.get("occurrences", [])),
+                })
+                report["reused"].append(item)
+                continue
+            except (OSError, SupportError):
+                pass
+        jobs.append((url, asset, relative, destination))
+
+    def fetch(job: tuple[str, dict[str, Any], str, Path]) -> tuple[str, dict[str, Any]]:
+        url, asset, relative, destination = job
         attempts = 0
         while attempts <= retries:
             attempts += 1
@@ -262,36 +358,50 @@ def download_assets(
                     "attempts": attempts,
                     "occurrence_count": len(asset.get("occurrences", [])),
                 })
-                report["downloaded"].append(item)
-                break
+                return "downloaded", item
             except AssetValidationError as exc:
-                report["failures"].append({
+                return "failures", {
                     "url": url,
                     "relative_path": relative,
                     "code": "validation_failed",
                     "message": str(exc),
                     "attempts": attempts,
-                })
-                break
+                }
             except (OSError, TimeoutError, urllib.error.URLError) as exc:
                 if attempts > retries:
-                    report["failures"].append({
+                    return "failures", {
                         "url": url,
                         "relative_path": relative,
                         "code": "download_failed",
                         "message": str(exc),
                         "attempts": attempts,
-                    })
-                    break
+                    }
                 if retry_delay_seconds:
                     time.sleep(retry_delay_seconds)
+        raise AssertionError("retry loop ended without a result")
+
+    completed_since_checkpoint = 0
+    if jobs:
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(fetch, job) for job in jobs]
+            try:
+                for future in as_completed(futures):
+                    section, item = future.result()
+                    report[section].append(item)
+                    completed_since_checkpoint += 1
+                    if completed_since_checkpoint >= checkpoint_every:
+                        checkpoint()
+                        completed_since_checkpoint = 0
+            finally:
+                if completed_since_checkpoint:
+                    checkpoint()
+    for section in ("downloaded", "reused", "failures"):
+        report[section].sort(key=lambda item: (str(item.get("relative_path", "")), str(item.get("url", ""))))
     if report["failures"]:
         report["status"] = "incomplete"
-    report["counts"] = {
-        "declared": len(assets),
-        "downloaded": len(report["downloaded"]),
-        "failed": len(report["failures"]),
-    }
+    update_counts()
+    if checkpoint_path is not None:
+        write_json(checkpoint_path, report)
     return report
 
 
@@ -306,19 +416,11 @@ def validate_local_assets(
         try:
             _validate_deterministic_asset_path(url, relative)
             path = _safe_destination(output_root, relative)
-            if not path.is_file():
-                raise AssetValidationError("declared local asset is missing")
-            size = path.stat().st_size
-            if size > max_bytes:
-                raise AssetValidationError(f"local asset exceeds {max_bytes} byte limit")
-            data = path.read_bytes()
-            image_format, _ = sniff_image(data)
+            inspected = _inspect_local_asset(path, max_bytes=max_bytes)
             results.append({
                 "url": url,
                 "relative_path": relative,
-                "bytes": size,
-                "sha256": hashlib.sha256(data).hexdigest(),
-                "format": image_format,
+                **inspected,
             })
         except (OSError, SupportError) as exc:
             failures.append({
@@ -387,9 +489,15 @@ def build_search_records(
     *,
     reading_vault_root: Path,
 ) -> dict[str, Any]:
-    """Write exactly one Markdown search record for each source-map Rem ID."""
-    if manifest.get("status") != "complete_for_requested_pilot":
-        raise SupportError("refusing to index a converter manifest that is not complete for its requested pilot")
+    """Write one Markdown search record for each knowledge-base/Rem identity."""
+    if manifest.get("status") not in {"complete_for_requested_pilot", "complete_full_migration"}:
+        raise SupportError("refusing to index a converter manifest that is not complete for its requested scope")
+    export = manifest.get("export")
+    if not isinstance(export, dict) or export.get("knowledgebase_identity_status") != "known":
+        raise SupportError("refusing to index without a known knowledge-base identity")
+    knowledgebase_id = export.get("knowledgebaseId")
+    if not isinstance(knowledgebase_id, str) or not knowledgebase_id:
+        raise SupportError("refusing to index without a knowledge-base ID")
     resolved_output = output_root.resolve()
     resolved_vault = reading_vault_root.resolve()
     if resolved_output == resolved_vault or _inside(resolved_output, resolved_vault):
@@ -408,12 +516,17 @@ def build_search_records(
             raise SupportError(f"source {rem_id!r} has no plain_original_text string")
         membership = _visible_membership(manifest, entry)
         citation = _source_citation(entry)
-        record_key = hashlib.sha256(rem_id.encode("utf-8")).hexdigest()[:24]
+        source_identity = f"remnote:{knowledgebase_id}:{rem_id}"
+        record_key = hashlib.sha256(
+            (knowledgebase_id + "\0" + rem_id).encode("utf-8")
+        ).hexdigest()[:24]
         relative = f"records/source-{record_key}.md"
         destination = output_root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         metadata = {
+            "knowledgebase_id": knowledgebase_id,
             "rem_id": rem_id,
+            "source_identity": source_identity,
             "source_citation": citation,
             "canonical": entry.get("canonical"),
             "canonical_origin": entry.get("canonical_origin"),
@@ -425,7 +538,9 @@ def build_search_records(
         lines = [
             "---",
             "record_type: remnote-source",
-            f"source_id: {json.dumps(rem_id, ensure_ascii=False)}",
+            f"knowledgebase_id: {json.dumps(knowledgebase_id, ensure_ascii=False)}",
+            f"rem_id: {json.dumps(rem_id, ensure_ascii=False)}",
+            f"source_identity: {json.dumps(source_identity, ensure_ascii=False)}",
             f"source_id_hash: {json.dumps(record_key)}",
             f"source_citation: {json.dumps(citation)}",
             f"visible_in_documents: {json.dumps(sorted(membership), ensure_ascii=False)}",
@@ -446,7 +561,9 @@ def build_search_records(
         body = "\n".join(lines)
         destination.write_text(body, encoding="utf-8")
         records.append({
+            "knowledgebase_id": knowledgebase_id,
             "rem_id": rem_id,
+            "source_identity": source_identity,
             "record_path": relative,
             "record_sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
             "source_citation": citation,
@@ -456,13 +573,116 @@ def build_search_records(
     registry = {
         "schema_version": 1,
         "record_type": "remnote-canonical-source-index",
-        "dedup_key": "rem_id",
+        "knowledgebase_id": knowledgebase_id,
+        "dedup_key": ["knowledgebase_id", "rem_id"],
         "records": records,
         "counts": {"sources": len(source_map), "records": len(records)},
         "invariant": "portal and expanded copies are appearances, never independent evidence records",
     }
     write_json(output_root / "records.json", registry)
     return registry
+
+
+def inventory_export_assets(export_path: Path) -> dict[str, Any]:
+    """Return aggregate image inventory without emitting URLs, IDs, or source text."""
+    try:
+        archive_size = export_path.stat().st_size
+        archive_digest = hashlib.sha256()
+        with export_path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                archive_digest.update(chunk)
+        archive_sha256 = archive_digest.hexdigest()
+        with zipfile.ZipFile(export_path) as archive:
+            candidates = []
+            for info in archive.infolist():
+                member = PurePosixPath(info.filename)
+                if member.is_absolute() or ".." in member.parts:
+                    raise SupportError(f"unsafe ZIP member path: {info.filename!r}")
+                if not info.is_dir() and member.name == "rem.json":
+                    candidates.append(info)
+            if len(candidates) != 1:
+                raise SupportError("expected exactly one rem.json in the export archive")
+            info = candidates[0]
+            if info.file_size > MAX_EXPORT_JSON_BYTES:
+                raise SupportError(f"rem.json exceeds {MAX_EXPORT_JSON_BYTES} byte inventory limit")
+            with archive.open(info) as handle:
+                raw = handle.read(MAX_EXPORT_JSON_BYTES + 1)
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise SupportError(f"could not read RemNote export: {exc}") from exc
+    if len(raw) > MAX_EXPORT_JSON_BYTES:
+        raise SupportError(f"rem.json exceeds {MAX_EXPORT_JSON_BYTES} byte inventory limit")
+    try:
+        parsed = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise SupportError(f"rem.json is not valid UTF-8 JSON: {exc}") from exc
+    if not isinstance(parsed, dict) or not isinstance(parsed.get("docs"), list):
+        raise SupportError("expected rem.json to contain an object with a docs list")
+    records = parsed["docs"]
+
+    urls: list[str] = []
+    missing_url_occurrences = 0
+
+    def walk(value: Any) -> None:
+        nonlocal missing_url_occurrences
+        if isinstance(value, dict):
+            if value.get("i") == "i":
+                raw_url = value.get("url")
+                if isinstance(raw_url, str) and raw_url.strip():
+                    urls.append(raw_url.strip())
+                else:
+                    missing_url_occurrences += 1
+            for child in value.values():
+                walk(child)
+        elif isinstance(value, list):
+            for child in value:
+                walk(child)
+
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        walk(record.get("key"))
+        walk(record.get("value"))
+
+    unique_urls = sorted(set(urls))
+    scheme_counts: Counter[str] = Counter()
+    host_counts: Counter[str] = Counter()
+    suffix_counts: Counter[str] = Counter()
+    hashed_paths: Counter[str] = Counter()
+    query_urls = 0
+    for url in unique_urls:
+        parsed_url = urllib.parse.urlparse(url)
+        scheme_counts[parsed_url.scheme.lower() or "[missing]"] += 1
+        host_counts[(parsed_url.hostname or "[missing]").lower()] += 1
+        suffix = PurePosixPath(parsed_url.path).suffix.lower() or "[none]"
+        suffix_counts[suffix] += 1
+        query_urls += bool(parsed_url.query)
+        hashed_paths[hashlib.sha256(url.encode("utf-8")).hexdigest()[:24]] += 1
+    return {
+        "schema_version": 1,
+        "record_type": "remnote-export-asset-inventory",
+        "source": {
+            "archive_bytes": archive_size,
+            "archive_sha256": archive_sha256,
+            "rem_json_bytes": len(raw),
+        },
+        "counts": {
+            "raw_records": len(records),
+            "image_occurrences": len(urls) + missing_url_occurrences,
+            "image_occurrences_with_url": len(urls),
+            "image_occurrences_missing_url": missing_url_occurrences,
+            "unique_urls": len(unique_urls),
+            "duplicate_url_occurrences": len(urls) - len(unique_urls),
+            "query_urls": query_urls,
+            "non_http_urls": sum(
+                count for scheme, count in scheme_counts.items() if scheme not in {"http", "https"}
+            ),
+            "deterministic_hash_collisions": sum(count - 1 for count in hashed_paths.values() if count > 1),
+        },
+        "schemes": dict(sorted(scheme_counts.items())),
+        "hosts": dict(sorted(host_counts.items())),
+        "suffixes": dict(sorted(suffix_counts.items())),
+        "privacy": "Aggregate counts only; source URLs, Rem IDs, and note text are omitted.",
+    }
 
 
 def propagate_privacy(
@@ -575,6 +795,7 @@ def main(argv: list[str] | None = None) -> int:
     download.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_ASSET_BYTES)
     download.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS)
     download.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    download.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
 
     validate = subparsers.add_parser("validate-assets")
     validate.add_argument("--manifest", required=True, type=Path)
@@ -582,28 +803,46 @@ def main(argv: list[str] | None = None) -> int:
     validate.add_argument("--report", required=True, type=Path)
     validate.add_argument("--max-bytes", type=int, default=DEFAULT_MAX_ASSET_BYTES)
 
+    inventory = subparsers.add_parser("inventory-export-assets")
+    inventory.add_argument("--input", required=True, type=Path)
+    inventory.add_argument("--report", required=True, type=Path)
+
     args = parser.parse_args(argv)
     try:
-        manifest = load_manifest(args.manifest)
-        if args.command == "build-records":
-            result = build_search_records(
-                manifest, args.output, reading_vault_root=args.reading_vault_root
-            )
-        elif args.command == "download-assets":
-            result = download_assets(
-                manifest,
-                args.output_root,
-                max_assets=args.max_assets,
-                max_bytes=args.max_bytes,
-                timeout_seconds=args.timeout,
-                retries=args.retries,
-            )
+        if args.command == "inventory-export-assets":
+            result = inventory_export_assets(args.input)
             write_json(args.report, result)
         else:
-            result = validate_local_assets(
-                manifest, args.output_root, max_bytes=args.max_bytes
+            manifest = load_manifest(
+                args.manifest, require_source_map=args.command == "build-records"
             )
-            write_json(args.report, result)
+            if args.command == "build-records":
+                result = build_search_records(
+                    manifest, args.output, reading_vault_root=args.reading_vault_root
+                )
+            elif args.command == "download-assets":
+                prior_report = None
+                if args.report.exists():
+                    try:
+                        prior_report = json.loads(args.report.read_text(encoding="utf-8"))
+                    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+                        raise SupportError(f"could not read prior download report: {exc}") from exc
+                result = download_assets(
+                    manifest,
+                    args.output_root,
+                    max_assets=args.max_assets,
+                    max_bytes=args.max_bytes,
+                    timeout_seconds=args.timeout,
+                    retries=args.retries,
+                    workers=args.workers,
+                    prior_report=prior_report,
+                    checkpoint_path=args.report,
+                )
+            else:
+                result = validate_local_assets(
+                    manifest, args.output_root, max_bytes=args.max_bytes
+                )
+                write_json(args.report, result)
     except (OSError, SupportError) as exc:
         parser.error(str(exc))
     print(json.dumps(result.get("counts", {}), sort_keys=True))

@@ -3,12 +3,14 @@ import json
 import tempfile
 import unittest
 import urllib.error
+import zipfile
 from pathlib import Path
 
 from pilot_support import (
     SupportError,
     build_search_records,
     download_assets,
+    inventory_export_assets,
     propagate_privacy,
     validate_local_assets,
 )
@@ -47,6 +49,10 @@ def manifest(source_map=None, assets=None):
     return {
         "schema_version": 1,
         "status": "complete_for_requested_pilot",
+        "export": {
+            "knowledgebaseId": "kb-public-fixture",
+            "knowledgebase_identity_status": "known",
+        },
         "files": [
             {"root_id": "doc-a", "path": "notes/Document A.md"},
             {"root_id": "doc-b", "path": "notes/Document B.md"},
@@ -63,13 +69,17 @@ def asset_path(url, suffix=".png"):
 
 
 class FakeResponse:
-    def __init__(self, data, content_type="image/png", url="https://media.example.test/a.png"):
+    def __init__(
+        self, data, content_type="image/png", url="https://media.example.test/a.png",
+        content_length=None, include_content_length=True,
+    ):
         self.data = data
         self.offset = 0
-        self.headers = {
-            "Content-Type": content_type,
-            "Content-Length": str(len(data)),
-        }
+        self.headers = {"Content-Type": content_type}
+        if include_content_length:
+            self.headers["Content-Length"] = str(
+                len(data) if content_length is None else content_length
+            )
         self.url = url
         self.closed = False
 
@@ -144,7 +154,11 @@ class CanonicalRecordTests(unittest.TestCase):
             )
             self.assertEqual(registry["records"][0]["visible_in_documents"], ["doc-b"])
             records_json = json.loads((root / "projection" / "records.json").read_text())
-            self.assertEqual(records_json["dedup_key"], "rem_id")
+            self.assertEqual(records_json["dedup_key"], ["knowledgebase_id", "rem_id"])
+            self.assertEqual(
+                records_json["records"][0]["source_identity"],
+                "remnote:kb-public-fixture:source-public",
+            )
 
     def test_projection_is_refused_inside_reading_vault(self):
         entry = source_entry("source-public", "Evidence", [], canonical=None)
@@ -170,6 +184,27 @@ class CanonicalRecordTests(unittest.TestCase):
                 build_search_records(
                     incomplete, root / "projection", reading_vault_root=vault
                 )
+
+    def test_unknown_knowledgebase_identity_is_not_indexed(self):
+        unknown = manifest({"source-public": source_entry("source-public", "Evidence", [])})
+        unknown["export"] = {"knowledgebase_identity_status": "unknown"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vault = root / "vault"
+            vault.mkdir()
+            with self.assertRaisesRegex(SupportError, "knowledge-base identity"):
+                build_search_records(unknown, root / "projection", reading_vault_root=vault)
+
+    def test_complete_schema_two_full_manifest_is_indexed(self):
+        complete = manifest({"source-public": source_entry("source-public", "Evidence", [])})
+        complete["schema_version"] = 2
+        complete["status"] = "complete_full_migration"
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            vault = root / "vault"
+            vault.mkdir()
+            result = build_search_records(complete, root / "projection", reading_vault_root=vault)
+            self.assertEqual(result["counts"], {"sources": 1, "records": 1})
 
 
 class PrivacyDependencyTests(unittest.TestCase):
@@ -259,6 +294,45 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(report["failures"][0]["code"], "validation_failed")
             self.assertFalse((root / relative).exists())
 
+    def test_truncated_body_does_not_match_declared_content_length(self):
+        url = "https://media.example.test/truncated.png"
+        relative = asset_path(url)
+
+        def opener(request, timeout):
+            return FakeResponse(self.png, content_type="image/png", url=url, content_length=999)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = download_assets(
+                manifest(assets={url: {"relative_path": relative, "occurrences": []}}),
+                root,
+                opener=opener,
+            )
+            self.assertEqual(report["status"], "incomplete")
+            self.assertIn("does not match Content-Length", report["failures"][0]["message"])
+            self.assertFalse((root / relative).exists())
+
+    def test_missing_content_length_stream_remains_byte_bounded(self):
+        url = "https://media.example.test/streamed.png"
+        relative = asset_path(url)
+
+        def opener(request, timeout):
+            return FakeResponse(
+                self.png, content_type="image/png", url=url, include_content_length=False
+            )
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            report = download_assets(
+                manifest(assets={url: {"relative_path": relative, "occurrences": []}}),
+                root,
+                max_bytes=len(self.png) - 1,
+                opener=opener,
+            )
+            self.assertEqual(report["status"], "incomplete")
+            self.assertIn("byte limit", report["failures"][0]["message"])
+            self.assertFalse((root / relative).exists())
+
     def test_escaping_or_non_deterministic_destination_is_reported(self):
         url = "https://media.example.test/a.png"
         report = download_assets(
@@ -280,6 +354,107 @@ class MediaTests(unittest.TestCase):
             self.assertEqual(result["status"], "incomplete")
             self.assertEqual(result["counts"], {"declared": 1, "valid": 0, "failed": 1})
             self.assertIn("missing", result["failures"][0]["message"])
+
+    def test_valid_existing_asset_is_reused_without_network_request(self):
+        url = "https://media.example.test/reused.png"
+        relative = asset_path(url)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / relative
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(self.png)
+            prior = {
+                "downloaded": [{
+                    "relative_path": relative,
+                    "sha256": hashlib.sha256(self.png).hexdigest(),
+                }],
+                "reused": [],
+            }
+            report = download_assets(
+                manifest(assets={url: {"relative_path": relative, "occurrences": []}}),
+                root,
+                opener=lambda request, timeout: self.fail("valid local asset must be reused"),
+                prior_report=prior,
+            )
+            self.assertEqual(report["status"], "complete")
+            self.assertEqual(report["counts"]["reused"], 1)
+            self.assertEqual(report["counts"]["downloaded"], 0)
+            self.assertEqual(report["reused"][0]["attempts"], 0)
+
+    def test_svg_is_rejected_without_real_export_evidence_or_a_sanitizer(self):
+        url = "https://media.example.test/unverified.svg"
+        relative = asset_path(url, ".svg")
+        svg = b'<svg xmlns="http://www.w3.org/2000/svg"><path d="M0 0h1v1z"/></svg>'
+
+        def opener(request, timeout):
+            return FakeResponse(svg, content_type="image/svg+xml", url=url)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            report = download_assets(
+                manifest(assets={url: {"relative_path": relative, "occurrences": []}}),
+                Path(temporary),
+                opener=opener,
+            )
+            self.assertEqual(report["status"], "incomplete")
+            self.assertIn("raster signature", report["failures"][0]["message"])
+
+    def test_existing_file_with_mismatched_trusted_hash_is_redownloaded(self):
+        url = "https://media.example.test/untrusted.png"
+        relative = asset_path(url)
+        replacement = self.png + b"-replacement"
+        calls = []
+
+        def opener(request, timeout):
+            calls.append(request.full_url)
+            return FakeResponse(replacement, url=url)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / relative
+            destination.parent.mkdir(parents=True)
+            destination.write_bytes(self.png + b"-tampered")
+            prior = {
+                "downloaded": [{
+                    "relative_path": relative,
+                    "sha256": hashlib.sha256(self.png).hexdigest(),
+                }],
+                "reused": [],
+            }
+            report = download_assets(
+                manifest(assets={url: {"relative_path": relative, "occurrences": []}}),
+                root,
+                opener=opener,
+                prior_report=prior,
+            )
+            self.assertEqual(calls, [url])
+            self.assertEqual(report["counts"]["reused"], 0)
+            self.assertEqual(destination.read_bytes(), replacement)
+
+
+class ExportInventoryTests(unittest.TestCase):
+    def test_inventory_is_aggregate_and_deduplicates_urls(self):
+        secret_url = "https://assets.example.test/private/image.png?token=secret"
+        payload = {
+            "knowledgebaseId": "private-kb-id",
+            "docs": [
+                {"_id": "private-rem-id", "key": [{"i": "i", "url": secret_url}]},
+                {"_id": "another-id", "value": [{"i": "i", "url": secret_url}, {"i": "i"}]},
+            ],
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            export = Path(temporary) / "fixture.rem"
+            with zipfile.ZipFile(export, "w") as archive:
+                archive.writestr("rem.json", json.dumps(payload))
+            report = inventory_export_assets(export)
+            self.assertEqual(report["counts"]["raw_records"], 2)
+            self.assertEqual(report["counts"]["image_occurrences"], 3)
+            self.assertEqual(report["counts"]["unique_urls"], 1)
+            self.assertEqual(report["counts"]["duplicate_url_occurrences"], 1)
+            self.assertEqual(report["counts"]["image_occurrences_missing_url"], 1)
+            serialized = json.dumps(report)
+            self.assertNotIn(secret_url, serialized)
+            self.assertNotIn("private-rem-id", serialized)
+            self.assertNotIn("private-kb-id", serialized)
 
 
 if __name__ == "__main__":

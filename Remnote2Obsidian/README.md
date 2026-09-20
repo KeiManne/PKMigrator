@@ -1,11 +1,17 @@
 # RemNote JSON to Obsidian converter
 
-## Bounded structured-export pilot
+## Structured export with portal copies
+
+For a staged whole-collection migration using the structured export and native
+Markdown file boundaries, see [FULL_EXPORT.md](FULL_EXPORT.md). It emits a
+record-by-record disposition ledger and keeps unresolved views explicit.
+The [read-only snapshot plugin](remnote-snapshot/README.md) captures live portal
+evidence for reconciliation; automatic-view semantics require live calibration.
 
 For a reviewable conversion of explicitly selected roots, including supported
 portal copies, stable source identities, rich text, and a structured manifest,
-see [PILOT.md](PILOT.md). The pilot has hard occurrence/depth limits and reports
-unsupported views as incomplete; it is not a whole-vault importer.
+see [PILOT.md](PILOT.md). Pilot mode has hard occurrence/depth limits and reports
+unsupported views as incomplete.
 
 The instructions below describe the original legacy converter.
 
