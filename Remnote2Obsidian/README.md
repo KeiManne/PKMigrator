@@ -1,5 +1,14 @@
 # RemNote JSON to Obsidian converter
 
+## Bounded structured-export pilot
+
+For a reviewable conversion of explicitly selected roots, including supported
+portal copies, stable source identities, rich text, and a structured manifest,
+see [PILOT.md](PILOT.md). The pilot has hard occurrence/depth limits and reports
+unsupported views as incomplete; it is not a whole-vault importer.
+
+The instructions below describe the original legacy converter.
+
 ## _TODO
 * [ ] include portals in bullets
 * [ ] Preserve the order of REM's as per Remnote Web app
