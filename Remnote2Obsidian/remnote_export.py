@@ -24,8 +24,22 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable
 
+from portal_evidence import (
+    AUTOMATIC_CONTENT_POLICY,
+    ORDINARY_CONTENT_POLICY,
+    PORTAL_EVIDENCE_SCHEMA,
+    PORTAL_RENDER_POLICY,
+    PortalEvidenceError,
+    TABLE_ROW_CONTENT_POLICY,
+    TABLE_SCHEMA_CONTENT_POLICY,
+    derive_portal_evidence,
+    portal_scope_policy_sha256,
+    validate_portal_evidence_artifact,
+)
+from reference_metadata import ReferenceMetadataIndex, extract_reference_metadata
 
-CONVERTER_VERSION = "0.2.0-full-staging"
+
+CONVERTER_VERSION = "0.4.0-evidenced-staging"
 DEFAULT_MAX_OCCURRENCES = 2_000
 DEFAULT_MAX_DEPTH = 50
 DEFAULT_FULL_MAX_OCCURRENCES = 500_000
@@ -75,6 +89,118 @@ def load_export(path: Path) -> tuple[dict[str, Any], str]:
     if not isinstance(payload, dict) or not isinstance(payload.get("docs"), list):
         raise ExportError("export must be an object containing a docs array")
     return payload, fingerprint
+
+
+def load_source_comparison_receipt(
+    path: Path,
+    *,
+    raw_export_sha256: str,
+    snapshot_file_sha256: str,
+    record_count: int,
+) -> tuple[dict[str, Any], str]:
+    """Load the private strict comparison receipt used to admit live portal evidence."""
+    raw = path.read_bytes()
+    try:
+        receipt = json.loads(raw)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ExportError(f"invalid source-comparison receipt: {exc}") from exc
+    if not isinstance(receipt, dict) or receipt.get("report_schema") != "remnote-private-drift-full/v1":
+        raise ExportError("unsupported source-comparison receipt schema")
+    inputs = receipt.get("inputs")
+    strict = receipt.get("strict_comparison")
+    decision = receipt.get("decision")
+    admission = receipt.get("capture_admission")
+    if not all(isinstance(value, dict) for value in (inputs, strict, decision, admission)):
+        raise ExportError("source-comparison receipt is missing required evidence sections")
+    if (
+        inputs.get("export_sha256") != raw_export_sha256
+        or inputs.get("snapshot_sha256") != snapshot_file_sha256
+        or inputs.get("export_records") != record_count
+        or inputs.get("snapshot_records") != record_count
+    ):
+        raise ExportError("source-comparison receipt does not match the supplied export and snapshot")
+    empty_mismatch_fields = (
+        "identity_export_only",
+        "identity_snapshot_only",
+        "parent_mismatches",
+        "created_at_mismatches",
+        "rich_v2_mismatches",
+    )
+    if (
+        decision.get("source_pair_exact") is not True
+        or decision.get("fresh_export_required") is not False
+        or decision.get("fresh_snapshot_required_for_source_drift") is not False
+        or strict.get("helper_passed") is not True
+        or strict.get("structural_and_content_exact") is not True
+        or strict.get("helper_error") is not None
+        or strict.get("child_mismatches") != {}
+        or any(strict.get(field) != [] for field in empty_mismatch_fields)
+        or admission.get("structural_pair_admissible") is not True
+        or admission.get("knowledgebase_consistent") is not True
+    ):
+        raise ExportError("source-comparison receipt does not prove exact source identity, hierarchy, and rich text")
+    return receipt, hashlib.sha256(raw).hexdigest()
+
+
+def create_source_comparison_receipt(
+    payload: dict[str, Any],
+    raw_export_sha256: str,
+    snapshot_contract: dict[str, Any],
+    snapshot_file_sha256: str,
+    *,
+    reviewed_receipt_sha256: str | None = None,
+) -> tuple[dict[str, Any], str]:
+    """Recompute the strict source comparison used for portal admission."""
+    exported = {
+        raw["_id"]: raw
+        for raw in payload.get("docs", [])
+        if isinstance(raw, dict) and isinstance(raw.get("_id"), str)
+    }
+    records = snapshot_contract.get("records")
+    if not isinstance(records, dict) or set(records) != set(exported):
+        raise ExportError("strict source comparison requires identical raw and snapshot record ID sets")
+    mismatches: Counter[str] = Counter()
+    for rem_id, raw in exported.items():
+        observed = records.get(rem_id)
+        if not isinstance(observed, dict) or observed.get("id") != rem_id:
+            mismatches["invalid_record"] += 1
+            continue
+        raw_parent = raw.get("parent") if isinstance(raw.get("parent"), str) else None
+        if observed.get("parent_id") != raw_parent:
+            mismatches["parent"] += 1
+        if observed.get("created_at") != raw.get("createdAt"):
+            mismatches["created_at"] += 1
+        if observed.get("export_comparable_rich_text_fingerprint") != _snapshot_rich_fingerprint(raw):
+            mismatches["rich_text"] += 1
+    _, child_mismatches = _derive_snapshot_children(exported, records)
+    mismatches.update(child_mismatches)
+    if mismatches:
+        summary = ", ".join(f"{field}={count}" for field, count in sorted(mismatches.items()))
+        raise ExportError(f"strict source comparison failed ({summary})")
+    receipt = {
+        "schema_version": "pkmigrator-source-comparison/v1",
+        "inputs": {
+            "raw_export_sha256": raw_export_sha256,
+            "snapshot_file_sha256": snapshot_file_sha256,
+            "raw_record_count": len(exported),
+            "snapshot_record_count": len(records),
+            "reviewed_receipt_sha256": reviewed_receipt_sha256,
+        },
+        "comparison": {
+            "identity_exact": True,
+            "parent_exact": True,
+            "created_at_exact": True,
+            "rich_text_fingerprint_exact": True,
+            "child_membership_complete": True,
+            "unambiguous_fractional_child_order_exact": True,
+            "ambiguous_fractional_order_source": "complete parent-consistent SDK child_ids",
+            "rich_text_algorithm": RICH_FINGERPRINT_ALGORITHM,
+            "child_order_raw_basis": CHILD_ORDER_BASIS,
+        },
+        "status": "complete",
+    }
+    encoded = (json.dumps(receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    return receipt, hashlib.sha256(encoded).hexdigest()
 
 
 def _plain_boundary_text(
@@ -573,7 +699,9 @@ def _inline_code(text: str) -> str:
 
 
 def _url(url: str) -> str:
-    return urllib.parse.quote(url, safe=":/?#[]@!$&'()*+,;=%")
+    # Markdown inline-link delimiters must be encoded even when they are valid
+    # URL characters; otherwise a literal closing parenthesis can end the link.
+    return urllib.parse.quote(url, safe=":/?#@!$&'*+,;=%")
 
 
 @dataclass(frozen=True)
@@ -603,6 +731,11 @@ class Converter:
         snapshot_contract_sha256: str | None = None,
         knowledgebase_id: str | None = None,
         split_candidates: dict[str, Any] | None = None,
+        exclude_subtree_roots: dict[str, str] | None = None,
+        exclude_source_ids: dict[str, str] | None = None,
+        document_plan: dict[str, dict[str, str]] | None = None,
+        reference_metadata: dict[str, Any] | None = None,
+        asset_omissions: dict[str, str] | None = None,
     ) -> None:
         if max_occurrences < 1 or max_depth < 1:
             raise ExportError("max_occurrences and max_depth must be positive")
@@ -614,7 +747,18 @@ class Converter:
         self.fingerprint = fingerprint
         self.mode = mode
         self.full_mode = mode == "full"
-        self.requested_file_map = dict(file_map or {})
+        self.native_file_map = dict(file_map or {})
+        if document_plan is not None and (
+            not isinstance(document_plan, dict)
+            or any(not isinstance(rem_id, str) or not isinstance(entry, dict) for rem_id, entry in document_plan.items())
+        ):
+            raise ExportError("document_plan must map Rem IDs to path/evidence objects")
+        self.document_plan = document_plan
+        self.requested_file_map = (
+            {rem_id: entry.get("path") for rem_id, entry in document_plan.items()}
+            if document_plan is not None
+            else dict(self.native_file_map)
+        )
         self.roots = list(self.requested_file_map) if self.full_mode else list(dict.fromkeys(str(x) for x in roots))
         if not self.roots:
             raise ExportError("at least one explicit root ID is required")
@@ -627,7 +771,24 @@ class Converter:
         self.snapshot_contract_sha256 = snapshot_contract_sha256
         self.knowledgebase_id = knowledgebase_id or payload.get("knowledgebaseId")
         self.split_candidates = split_candidates or {}
+        self.exclude_subtree_roots = dict(exclude_subtree_roots or {})
+        self.exclude_source_ids = dict(exclude_source_ids or {})
+        self.reference_metadata_config = reference_metadata
+        self.asset_omissions = dict(asset_omissions or {})
+        for source, reason in self.asset_omissions.items():
+            if not isinstance(source, str) or not source or not isinstance(reason, str) or not reason.strip():
+                raise ExportError("asset_omissions must map non-empty HTTP(S) URLs to non-empty reviewed reasons")
+            parsed = urllib.parse.urlparse(source)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or not parsed.netloc
+                or parsed.username is not None
+                or parsed.password is not None
+                or any(character.isspace() or character == "\\" for character in source)
+            ):
+                raise ExportError(f"asset_omissions contains an unsafe URL: {source!r}")
         self.index: dict[str, dict[str, Any]] = {}
+        self.ownership_children: dict[str, list[str]] = defaultdict(list)
         self.children: dict[str, list[str]] = defaultdict(list)
         self.files: dict[str, str] = {}
         self.canonical: dict[str, dict[str, str]] = {}
@@ -640,6 +801,29 @@ class Converter:
         self._referenced_canonical: set[str] = set()
         self._generated_context_export_ids: set[str] = set()
         self._generated_context_snapshot_ids: set[str] = set()
+        self._scope_exclusions: dict[str, dict[str, Any]] = {}
+        self._system_exclusions: dict[str, dict[str, Any]] = {}
+        self.reference_metadata_index: ReferenceMetadataIndex | None = None
+        self._reference_materializations: list[dict[str, Any]] = []
+        self._materialized_reference_edges: set[tuple[str, str]] = set()
+        self._asset_omission_occurrences: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        self.portal_evidence: dict[str, Any] | None = None
+        self._portal_locations: dict[str, dict[str, str]] = {}
+        self._root_portal_entry_ids: set[str] = set()
+        self._active_portal_ids: set[str] = set()
+        self._portal_canonical_owners: dict[str, str] = {}
+        self._rendered_portal_canonical: set[str] = set()
+        self._automatic_policy_omitted_ids: set[str] = set()
+        self._automatic_row_cell_ids: set[str] = set()
+        self._portal_hidden_omitted_ids: set[str] = set()
+        self._empty_table_schema_wrapper_ids: set[str] = set()
+        self.source_comparison_receipt: dict[str, Any] | None = None
+        self.source_comparison_receipt_sha256: str | None = None
+        self.scope_policy_sha256 = portal_scope_policy_sha256({
+            "exclude_subtree_roots": self.exclude_subtree_roots,
+            "exclude_source_ids": self.exclude_source_ids,
+            "document_plan": self.document_plan or {},
+        })
         self._prepare_index()
         if self.full_mode:
             for rem_id in self.split_candidates:
@@ -676,6 +860,355 @@ class Converter:
             self._validate_snapshot_scope()
             self._validate_snapshot_boundaries()
 
+    def admitted_portal_locations(self) -> dict[str, dict[str, str]]:
+        """Return type-6 ownership nodes reachable from retained output documents."""
+        locations: dict[str, dict[str, str]] = {}
+
+        root_entries: set[str] = set()
+
+        def visit(rem_id: str, root_id: str, seen: set[str], beneath_portal: bool) -> None:
+            if rem_id in seen or rem_id not in self.index:
+                return
+            decision = self._scope_exclusions.get(rem_id)
+            if decision and decision.get("kind") == "subtree":
+                return
+            if self._is_excluded(rem_id):
+                for child in self.ownership_children.get(rem_id, []):
+                    visit(child, root_id, seen | {rem_id}, beneath_portal)
+                return
+            if rem_id in self.files and rem_id != root_id:
+                return
+            if self.index[rem_id].get("type") == 6:
+                location = {"file": self.files[root_id], "root_id": root_id}
+                previous = locations.get(rem_id)
+                if previous is not None and previous != location:
+                    raise ExportError(f"portal {rem_id!r} is reachable from multiple output documents")
+                locations[rem_id] = location
+                if not beneath_portal:
+                    root_entries.add(rem_id)
+                beneath_portal = True
+            for child in self.ownership_children.get(rem_id, []):
+                visit(child, root_id, seen | {rem_id}, beneath_portal)
+
+        for root_id in self.roots:
+            if root_id not in self.files:
+                continue
+            for child in self.ownership_children.get(root_id, []):
+                visit(child, root_id, {root_id}, False)
+        self._root_portal_entry_ids = root_entries
+        return locations
+
+    def install_portal_evidence(
+        self,
+        evidence: dict[str, Any],
+        *,
+        source_comparison_receipt: dict[str, Any],
+        source_comparison_receipt_sha256: str,
+    ) -> None:
+        """Validate and install immutable, hash-bound portal rendering plans."""
+        locations = self.admitted_portal_locations()
+        canonical_receipt = (
+            json.dumps(source_comparison_receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        ).encode("utf-8")
+        if hashlib.sha256(canonical_receipt).hexdigest() != source_comparison_receipt_sha256:
+            raise ExportError("source-comparison receipt object does not match its supplied digest")
+        if self.snapshot_contract is None:
+            raise ExportError("portal evidence requires the loaded snapshot contract")
+        expected_evidence = derive_portal_evidence(
+            self.snapshot_contract,
+            self.index,
+            locations,
+            set(self._scope_exclusions) | set(self._system_exclusions),
+            raw_export_sha256=self.fingerprint,
+            scope_policy_sha256=self.scope_policy_sha256,
+            source_comparison_receipt_sha256=source_comparison_receipt_sha256,
+            expected_knowledgebase_id=self.knowledgebase_id,
+        )
+        if evidence != expected_evidence:
+            raise ExportError("portal evidence payload differs from a fresh derivation over current inputs")
+        validate_portal_evidence_artifact(
+            evidence,
+            expected_knowledgebase_id=self.knowledgebase_id,
+            expected_snapshot_payload_sha256=self.snapshot_contract.get("capture", {}).get("payload_sha256"),
+            expected_raw_export_sha256=self.fingerprint,
+            expected_scope_policy_sha256=self.scope_policy_sha256,
+            expected_source_comparison_receipt_sha256=source_comparison_receipt_sha256,
+            expected_raw_record_ids=self.index,
+            expected_admitted_portal_ids=locations,
+            expected_excluded_source_ids=set(self._scope_exclusions) | set(self._system_exclusions),
+        )
+        plans = evidence.get("plans")
+        coverage = evidence.get("coverage")
+        binding = evidence.get("binding")
+        policy = evidence.get("render_policy")
+        if evidence.get("schema_version") != PORTAL_EVIDENCE_SCHEMA:
+            raise ExportError("unsupported portal evidence schema")
+        if not all(isinstance(value, dict) for value in (plans, coverage, binding, policy)):
+            raise ExportError("portal evidence is missing required sections")
+        if (
+            policy.get("policy_id") != PORTAL_RENDER_POLICY
+            or policy.get("provenance") != "explicit-user-choice"
+            or coverage.get("complete") is not True
+            or coverage.get("unresolved_portal_ids") != []
+            or evidence.get("diagnostics") != []
+        ):
+            raise ExportError("portal evidence is incomplete or uses an unapproved rendering policy")
+        if set(plans) != set(locations):
+            raise ExportError("portal evidence coverage does not exactly match retained output portals")
+        if (
+            binding.get("raw_export_sha256") != self.fingerprint
+            or binding.get("snapshot_payload_sha256") != self.snapshot_contract.get("capture", {}).get("payload_sha256")
+            or binding.get("scope_policy_sha256") != self.scope_policy_sha256
+            or binding.get("source_comparison_receipt_sha256") != source_comparison_receipt_sha256
+            or binding.get("knowledgebase_id") != self.knowledgebase_id
+        ):
+            raise ExportError("portal evidence binding does not match converter inputs")
+        for portal_id, plan in plans.items():
+            if not isinstance(plan, dict) or plan.get("complete") is not True:
+                raise ExportError(f"portal evidence plan is incomplete for {portal_id!r}")
+            expected_policy = (
+                ORDINARY_CONTENT_POLICY
+                if plan.get("kind") == "ordinary-content"
+                else AUTOMATIC_CONTENT_POLICY
+                if plan.get("kind") in {"contextual-search", "flat-search"}
+                else None
+            )
+            appearances = plan.get("appearances")
+            if expected_policy is None or not isinstance(appearances, list):
+                raise ExportError(f"portal evidence plan has unsupported kind for {portal_id!r}")
+            if any(not isinstance(item, dict) or item.get("content_policy") != expected_policy for item in appearances):
+                raise ExportError(f"portal evidence appearance policy mismatch for {portal_id!r}")
+            if plan.get("kind") == "flat-search":
+                if plan.get("table_schema_complete") is not True:
+                    raise ExportError(f"flat portal table-schema evidence is incomplete for {portal_id!r}")
+                for item in plan.get("appearances", []):
+                    if "owned_table_descendant_ids" in item and item.get("owned_table_content_policy") != TABLE_ROW_CONTENT_POLICY:
+                        raise ExportError(f"flat portal row content policy mismatch for {portal_id!r}")
+                schema_items = [
+                    *plan.get("table_schema_roots", []),
+                    *plan.get("omitted_empty_table_schema_wrappers", []),
+                ]
+                if any(
+                    not isinstance(item, dict)
+                    or item.get("content_policy") != TABLE_SCHEMA_CONTENT_POLICY
+                    for item in schema_items
+                ):
+                    raise ExportError(f"flat portal table-schema policy mismatch for {portal_id!r}")
+                visibility_states = plan.get("table_schema_visibility_states")
+                hidden_schema_ids = plan.get("hidden_table_schema_record_ids")
+                if not isinstance(visibility_states, dict) or not isinstance(hidden_schema_ids, list):
+                    raise ExportError(f"flat portal table-schema visibility evidence is missing for {portal_id!r}")
+                rendered_schema_ids = {
+                    item["wrapper_id"]
+                    for item in schema_items
+                } | {
+                    rem_id
+                    for item in schema_items
+                    for rem_id in item.get("ordered_label_ids", item.get("promoted_label_ids", []))
+                }
+                for rem_id in rendered_schema_ids:
+                    state = visibility_states.get(rem_id)
+                    if (
+                        not isinstance(state, dict)
+                        or state.get("explicit_hidden") is not False
+                        or state.get("sdk_state") not in {None, "none", "included"}
+                        or state.get("raw_ph_state") == "h"
+                    ):
+                        raise ExportError(f"flat portal table-schema visibility is unresolved for {rem_id!r}")
+        self.portal_evidence = evidence
+        self._portal_locations = locations
+        self.source_comparison_receipt = source_comparison_receipt
+        self.source_comparison_receipt_sha256 = source_comparison_receipt_sha256
+        self._active_portal_ids = self._derive_active_portal_ids()
+        self._assign_portal_canonical_sources()
+        self._adjudicate_snapshot_source_issues()
+
+    def _assign_portal_canonical_sources(self) -> None:
+        assert self.portal_evidence is not None
+
+        def assign_one(rem_id: str, portal_id: str, location: dict[str, str], context: str) -> None:
+            if rem_id not in self.canonical:
+                self.canonical[rem_id] = {
+                    "file": location["file"],
+                    "anchor": stable_anchor(rem_id, context),
+                }
+                self._portal_canonical_owners[rem_id] = portal_id
+
+        def assign_tree(rem_id: str, portal_id: str, location: dict[str, str], states: dict[str, Any], path: tuple[str, ...], seen: set[str]) -> None:
+            if rem_id in seen or rem_id not in self.index:
+                return
+            state = states.get(rem_id)
+            if state not in {"none", "included", "root", "hidden"}:
+                raise ExportError(f"portal visibility evidence is unresolved for retained record {rem_id!r}")
+            if state == "hidden":
+                pending = [rem_id]
+                while pending:
+                    hidden_id = pending.pop()
+                    if hidden_id in self._portal_hidden_omitted_ids or hidden_id not in self.index:
+                        continue
+                    if self.index[hidden_id].get("type") != 6 and hidden_id not in self.canonical:
+                        self._portal_hidden_omitted_ids.add(hidden_id)
+                    pending.extend(self.children.get(hidden_id, []))
+                return
+            decision = self._scope_exclusions.get(rem_id)
+            if decision and decision.get("kind") == "subtree":
+                return
+            if self._is_excluded(rem_id):
+                for child in self.children.get(rem_id, []):
+                    assign_tree(child, portal_id, location, states, path + (rem_id,), seen | {rem_id})
+                return
+            if self.index[rem_id].get("type") == 6 or (rem_id in self.files and rem_id != location["root_id"]):
+                return
+            if rem_id not in self.canonical:
+                context = f"portal-canonical:{portal_id}:{'/'.join(path + (rem_id,))}"
+                self.canonical[rem_id] = {
+                    "file": location["file"],
+                    "anchor": stable_anchor(rem_id, context),
+                }
+                self._portal_canonical_owners[rem_id] = portal_id
+            for child in self.children.get(rem_id, []):
+                assign_tree(child, portal_id, location, states, path + (rem_id,), seen | {rem_id})
+
+        for portal_id in sorted(self._active_portal_ids):
+            plan = self.portal_evidence["plans"][portal_id]
+            location = self._portal_locations[portal_id]
+            for appearance in plan["appearances"]:
+                context_id = appearance["context_portal_id"]
+                states = plan.get("visibility_contexts", {}).get(context_id, {})
+                anchor_id = appearance["anchor_id"]
+                if plan["kind"] == "ordinary-content":
+                    assign_tree(anchor_id, portal_id, location, states, (), set())
+                elif anchor_id not in self.canonical:
+                    context = f"portal-canonical:{portal_id}:automatic:{anchor_id}"
+                    self.canonical[anchor_id] = {
+                        "file": location["file"],
+                        "anchor": stable_anchor(anchor_id, context),
+                    }
+                    self._portal_canonical_owners[anchor_id] = portal_id
+                owned_ids = appearance.get("owned_table_descendant_ids", [])
+                hidden_ids = appearance.get("hidden_table_descendant_ids", [])
+                descendant_states = appearance.get("owned_table_descendant_visibility_states", {})
+                if owned_ids or hidden_ids:
+                    if appearance.get("owned_table_content_policy") != TABLE_ROW_CONTENT_POLICY:
+                        raise ExportError(f"flat table row policy is missing for {anchor_id!r}")
+                    if not isinstance(descendant_states, dict):
+                        raise ExportError(f"flat table row visibility map is malformed for {anchor_id!r}")
+                    for descendant_id in owned_ids:
+                        if descendant_states.get(descendant_id) not in {"none", "included"}:
+                            raise ExportError(f"flat table row has unresolved visible descendant {descendant_id!r}")
+                        assign_one(
+                            descendant_id,
+                            portal_id,
+                            location,
+                            f"portal-canonical:{portal_id}:table-row:{anchor_id}:{descendant_id}",
+                        )
+                        self._automatic_row_cell_ids.add(descendant_id)
+                    for descendant_id in hidden_ids:
+                        if descendant_states.get(descendant_id) != "hidden":
+                            raise ExportError(f"flat table row has unresolved hidden descendant {descendant_id!r}")
+                        self._portal_hidden_omitted_ids.add(descendant_id)
+
+                pending = list(self.children.get(anchor_id, []))
+                seen: set[str] = set()
+                while pending:
+                    descendant_id = pending.pop()
+                    if descendant_id in seen or descendant_id not in self.index:
+                        continue
+                    seen.add(descendant_id)
+                    if self.index[descendant_id].get("type") == 6:
+                        continue
+                    if (
+                        descendant_id not in self.canonical
+                        and descendant_id not in self._automatic_row_cell_ids
+                        and not self._is_excluded(descendant_id)
+                    ):
+                        self._automatic_policy_omitted_ids.add(descendant_id)
+                    pending.extend(self.children.get(descendant_id, []))
+
+            if plan["kind"] == "flat-search":
+                self._portal_hidden_omitted_ids.update(plan.get("hidden_table_schema_record_ids", []))
+                for schema in plan.get("table_schema_roots", []):
+                    wrapper_id = schema["wrapper_id"]
+                    assign_one(
+                        wrapper_id,
+                        portal_id,
+                        location,
+                        f"portal-canonical:{portal_id}:table-schema:{wrapper_id}",
+                    )
+                    for label_id in schema["ordered_label_ids"]:
+                        assign_one(
+                            label_id,
+                            portal_id,
+                            location,
+                            f"portal-canonical:{portal_id}:table-schema-label:{wrapper_id}:{label_id}",
+                        )
+                for schema in plan.get("omitted_empty_table_schema_wrappers", []):
+                    wrapper_id = schema["wrapper_id"]
+                    self._empty_table_schema_wrapper_ids.add(wrapper_id)
+                    for label_id in schema["promoted_label_ids"]:
+                        assign_one(
+                            label_id,
+                            portal_id,
+                            location,
+                            f"portal-canonical:{portal_id}:promoted-table-schema-label:{wrapper_id}:{label_id}",
+                        )
+
+    def _derive_active_portal_ids(self) -> set[str]:
+        """Find plans that can actually render under the approved recursion policy."""
+        assert self.portal_evidence is not None
+        active = set(self._root_portal_entry_ids)
+
+        def nested_portals(rem_id: str, seen: set[str]) -> set[str]:
+            if rem_id in seen or rem_id not in self.index:
+                return set()
+            decision = self._scope_exclusions.get(rem_id)
+            if decision and decision.get("kind") == "subtree":
+                return set()
+            if self._is_excluded(rem_id):
+                result: set[str] = set()
+                for child in self.children.get(rem_id, []):
+                    result.update(nested_portals(child, seen | {rem_id}))
+                return result
+            if self.index[rem_id].get("type") == 6:
+                return {rem_id}
+            result = set()
+            for child in self.children.get(rem_id, []):
+                result.update(nested_portals(child, seen | {rem_id}))
+            return result
+
+        pending = list(active)
+        while pending:
+            portal_id = pending.pop()
+            plan = self.portal_evidence["plans"][portal_id]
+            if plan.get("kind") != "ordinary-content":
+                continue
+            discovered: set[str] = set()
+            for appearance in plan["appearances"]:
+                for child in self.children.get(appearance["anchor_id"], []):
+                    discovered.update(nested_portals(child, {appearance["anchor_id"]}))
+            new_ids = discovered - active
+            active.update(new_ids)
+            pending.extend(new_ids)
+        return active
+
+    def _adjudicate_snapshot_source_issues(self) -> None:
+        if self.source_comparison_receipt_sha256 is None:
+            return
+        codes = {
+            "snapshot_capture_incomplete",
+            "snapshot_rich_text_comparison_uncalibrated",
+            "snapshot_child_order_comparison_uncalibrated",
+            "snapshot_scope_incomplete",
+        }
+        for issue in self.issues:
+            if issue["code"] in codes and issue["severity"] == "error":
+                issue["severity"] = "warning"
+                issue["details"] = {
+                    **issue.get("details", {}),
+                    "offline_source_comparison_receipt_sha256": self.source_comparison_receipt_sha256,
+                    "adjudication": "Source bodies, identity, parents, created timestamps, and ordered children were independently compared; original capture flags remain unchanged.",
+                }
+
     def _snapshot_classification(self, name: str) -> dict[str, Any]:
         if not self.snapshot_contract:
             return {}
@@ -686,11 +1219,14 @@ class Converter:
         return value if isinstance(value, dict) else {}
 
     def _is_evidenced_system_definition(self, rem_id: str) -> bool:
+        return bool(self._system_definition_evidence(rem_id))
+
+    def _system_definition_evidence(self, rem_id: str) -> dict[str, Any]:
         classification = self._snapshot_classification("system_definition")
         states = classification.get("states")
         state = states.get(rem_id) if isinstance(states, dict) else None
         if not isinstance(state, dict):
-            return False
+            return {}
         fields = (
             "is_powerup",
             "is_powerup_enum",
@@ -698,7 +1234,269 @@ class Converter:
             "is_powerup_slot",
             "is_powerup_property",
         )
-        return any(state.get(field) is True for field in fields)
+        positive = [field for field in fields if state.get(field) is True]
+        if not positive:
+            return {}
+        return {
+            "positive_predicates": positive,
+            "method": classification.get("method"),
+        }
+
+    def _is_excluded(self, rem_id: str) -> bool:
+        return rem_id in self._scope_exclusions or rem_id in self._system_exclusions
+
+    def _prepare_reference_metadata(self) -> None:
+        config = self.reference_metadata_config
+        if config is None:
+            return
+        if not isinstance(config, dict):
+            raise ExportError("reference_metadata must be a path-independent configuration object")
+        roots = config.get("reviewed_root_ids")
+        link_type_id = config.get("link_type_id")
+        evidence = config.get("evidence")
+        if (
+            not isinstance(roots, list)
+            or not roots
+            or any(not isinstance(rem_id, str) or not rem_id for rem_id in roots)
+            or len(set(roots)) != len(roots)
+        ):
+            raise ExportError("reference_metadata.reviewed_root_ids must be a non-empty unique string list")
+        if not isinstance(link_type_id, str) or not link_type_id:
+            raise ExportError("reference_metadata.link_type_id must be a non-empty Rem ID")
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise ExportError("reference_metadata.evidence must be a non-empty reviewed reason")
+        unknown = sorted(set(roots) - set(self.index))
+        if unknown:
+            raise ExportError("reference_metadata contains unknown reviewed roots: " + ", ".join(unknown))
+        self.reference_metadata_index = extract_reference_metadata(
+            self.index.values(), roots, link_type_id
+        )
+
+    @staticmethod
+    def _rich_reference_targets(value: Any) -> set[str]:
+        targets: set[str] = set()
+
+        def visit(item: Any) -> None:
+            if isinstance(item, list):
+                for child in item:
+                    visit(child)
+            elif isinstance(item, dict):
+                if item.get("i") == "q" and item.get("_id"):
+                    targets.add(str(item["_id"]))
+                    return
+                for child in item.values():
+                    if isinstance(child, (list, dict)):
+                        visit(child)
+
+        visit(value)
+        return targets
+
+    def _reference_metadata_report(self) -> dict[str, Any]:
+        if self.reference_metadata_index is None:
+            return {"status": "not_configured"}
+        entries = self.reference_metadata_index.entries
+        unresolved = self.reference_metadata_index.unresolved
+        eligible_owners = (set(self.canonical) | set(self.source_map)) - (
+            set(self._scope_exclusions) | set(self._system_exclusions)
+        )
+        expected_edges: set[tuple[str, str]] = set()
+        unresolved_edges: set[tuple[str, str]] = set()
+        for owner_id in eligible_owners:
+            raw = self.index[owner_id]
+            targets = self._rich_reference_targets(raw.get("key")) | self._rich_reference_targets(raw.get("value"))
+            for target_id in targets:
+                if target_id in entries:
+                    expected_edges.add((owner_id, target_id))
+                elif target_id in unresolved:
+                    unresolved_edges.add((owner_id, target_id))
+        missing_edges = expected_edges - self._materialized_reference_edges
+        if unresolved_edges:
+            self.issue(
+                "reference_metadata_unresolved_edges",
+                "error",
+                "Retained source references target reviewed metadata records that did not produce safe external links",
+                details={
+                    "edge_count": len(unresolved_edges),
+                    "target_count": len({target for _, target in unresolved_edges}),
+                },
+            )
+        if missing_edges:
+            self.issue(
+                "reference_metadata_materialization_incomplete",
+                "error",
+                "Expected retained external-reference edges were not materialized in rendered output",
+                details={
+                    "edge_count": len(missing_edges),
+                    "target_count": len({target for _, target in missing_edges}),
+                },
+            )
+
+        def edges(items: set[tuple[str, str]]) -> list[dict[str, str]]:
+            return [
+                {"owner_id": owner_id, "target_id": target_id}
+                for owner_id, target_id in sorted(items)
+            ]
+
+        return {
+            "status": "complete" if not unresolved_edges and not missing_edges else "incomplete",
+            "configuration": self.reference_metadata_config,
+            "targets": {
+                rem_id: {
+                    "url": item.url,
+                    "label": item.label,
+                    "provenance": dict(item.provenance),
+                }
+                for rem_id, item in sorted(entries.items())
+            },
+            "unresolved": dict(sorted(unresolved.items())),
+            "materializations": self._reference_materializations,
+            "expected_retained_edges": edges(expected_edges),
+            "materialized_retained_edges": edges(expected_edges & self._materialized_reference_edges),
+            "missing_retained_edges": edges(missing_edges),
+            "unresolved_retained_edges": edges(unresolved_edges),
+            "counts": {
+                "resolved_targets": len(entries),
+                "unresolved_reviewed_records": len(unresolved),
+                "materialization_appearances": len(self._reference_materializations),
+                "expected_retained_edges": len(expected_edges),
+                "materialized_retained_edges": len(expected_edges & self._materialized_reference_edges),
+                "missing_retained_edges": len(missing_edges),
+                "unresolved_retained_edges": len(unresolved_edges),
+            },
+        }
+
+    def _prepare_exclusions(self) -> None:
+        for field, configured in (
+            ("exclude_subtree_roots", self.exclude_subtree_roots),
+            ("exclude_source_ids", self.exclude_source_ids),
+        ):
+            if any(
+                not isinstance(rem_id, str)
+                or not rem_id
+                or not isinstance(reason, str)
+                or not reason.strip()
+                for rem_id, reason in configured.items()
+            ):
+                raise ExportError(f"{field} must map non-empty Rem IDs to non-empty reasons")
+            unknown = sorted(set(configured) - set(self.index))
+            if unknown:
+                raise ExportError(f"{field} contains unknown Rem IDs: {', '.join(unknown)}")
+
+        for root_id, reason in self.exclude_subtree_roots.items():
+            pending = [root_id]
+            seen: set[str] = set()
+            while pending:
+                rem_id = pending.pop()
+                if rem_id in seen:
+                    continue
+                seen.add(rem_id)
+                existing = self._scope_exclusions.get(rem_id)
+                if existing and existing["rule_id"] != root_id:
+                    raise ExportError(
+                        f"exclude_subtree_roots overlap at {rem_id!r}: "
+                        f"{existing['rule_id']!r} and {root_id!r}"
+                    )
+                self._scope_exclusions[rem_id] = {
+                    "kind": "subtree",
+                    "rule_id": root_id,
+                    "reason": reason.strip(),
+                    "rule_root": rem_id == root_id,
+                }
+                pending.extend(self.ownership_children.get(rem_id, []))
+
+        overlap = sorted(set(self.exclude_source_ids) & set(self._scope_exclusions))
+        if overlap:
+            raise ExportError(
+                "exclude_source_ids overlap excluded subtrees: " + ", ".join(overlap)
+            )
+        for rem_id, reason in self.exclude_source_ids.items():
+            self._scope_exclusions[rem_id] = {
+                "kind": "source",
+                "rule_id": rem_id,
+                "reason": reason.strip(),
+                "rule_root": True,
+            }
+
+        for rem_id in self.index:
+            evidence = self._system_definition_evidence(rem_id)
+            if evidence:
+                self._system_exclusions[rem_id] = evidence
+
+    def _validate_document_plan(self) -> None:
+        if self.document_plan is None:
+            return
+        if not self.full_mode:
+            raise ExportError("document_plan is supported only in full mode")
+        if not self.document_plan:
+            raise ExportError("document_plan must contain at least one retained output boundary")
+        normalized_paths: dict[str, str] = {}
+        for rem_id, entry in self.document_plan.items():
+            path = entry.get("path")
+            evidence = entry.get("evidence")
+            if rem_id not in self.index:
+                raise ExportError(f"document_plan contains unknown Rem ID: {rem_id!r}")
+            if self.index[rem_id].get("type") == 6:
+                raise ExportError(f"document_plan boundary cannot be a portal: {rem_id!r}")
+            if self._is_excluded(rem_id):
+                raise ExportError(f"document_plan includes an excluded source/system Rem ID: {rem_id!r}")
+            if not isinstance(path, str) or not path:
+                raise ExportError(f"document_plan entry {rem_id!r} needs a non-empty path")
+            if not isinstance(evidence, str) or not evidence.strip():
+                raise ExportError(f"document_plan entry {rem_id!r} needs non-empty evidence")
+            relative = PurePosixPath(path)
+            if (
+                relative.is_absolute()
+                or ".." in relative.parts
+                or relative.suffix.lower() != ".md"
+                or relative.parts[:2] != ("Sources", "RemNote")
+            ):
+                raise ExportError(f"unsafe document_plan path for {rem_id!r}: {path!r}")
+            for component in relative.parts[2:]:
+                stem = PurePosixPath(component).stem if component == relative.name else component
+                if (
+                    not component
+                    or component != component.strip(" .")
+                    or re.search(r'[<>:"\\|?*#\[\]^\x00-\x1f]', component)
+                    or stem.upper() in WINDOWS_RESERVED
+                    or len(component.encode("utf-8")) > 240
+                ):
+                    raise ExportError(f"unsafe document_plan path component for {rem_id!r}: {component!r}")
+            folded = unicodedata.normalize("NFKC", str(relative)).casefold()
+            if folded in normalized_paths:
+                raise ExportError(
+                    f"duplicate document_plan path: {path!r} and {normalized_paths[folded]!r}"
+                )
+            normalized_paths[folded] = path
+
+    def _retained_child_has_owner(self, excluded_id: str, child_id: str) -> bool:
+        if child_id in self.files:
+            return True
+        current = self.index.get(excluded_id, {}).get("parent")
+        seen: set[str] = set()
+        while isinstance(current, str) and current in self.index and current not in seen:
+            seen.add(current)
+            if self.index[current].get("type") == 6:
+                return False
+            if current in self.files:
+                return True
+            current = self.index[current].get("parent")
+        return False
+
+    def _validate_retained_children_of_exact_exclusions(self) -> None:
+        exact_ids = set(self.exclude_source_ids) | set(self._system_exclusions)
+        for rem_id in sorted(exact_ids):
+            for child_id in self.ownership_children.get(rem_id, []):
+                if self._is_excluded(child_id):
+                    continue
+                if self._retained_child_has_owner(rem_id, child_id):
+                    continue
+                self.issue(
+                    "excluded_parent_retained_child_unowned",
+                    "error",
+                    "An exact source/system exclusion has a retained child without a rendered output owner",
+                    rem_id=child_id,
+                    details={"excluded_parent_id": rem_id},
+                )
 
     def _validate_snapshot_boundaries(self) -> None:
         classification = self._snapshot_classification("document_and_folder")
@@ -710,10 +1508,10 @@ class Converter:
                 "Snapshot does not contain document/folder classification states",
             )
             return
-        missing_boundaries = sorted(set(self.files) - set(states))
+        missing_boundaries = sorted(set(self.native_file_map) - set(states))
         conflicts = sorted(
             rem_id
-            for rem_id in self.files
+            for rem_id in self.native_file_map
             if isinstance(states.get(rem_id), dict)
             and states[rem_id].get("is_document") is not True
             and states[rem_id].get("is_folder") is not True
@@ -722,7 +1520,7 @@ class Converter:
             rem_id
             for rem_id, state in states.items()
             if rem_id in self.index
-            and rem_id not in self.files
+            and rem_id not in self.native_file_map
             and isinstance(state, dict)
             and (state.get("is_document") is True or state.get("is_folder") is True)
         )
@@ -733,19 +1531,48 @@ class Converter:
                 "Snapshot did not classify every native Markdown boundary",
                 details={"missing_count": len(missing_boundaries)},
             )
-        if conflicts:
+        reviewed_conflicts = [
+            rem_id for rem_id in conflicts
+            if self._is_excluded(rem_id) or (self.document_plan is not None and rem_id in self.document_plan)
+        ]
+        unresolved_conflicts = sorted(set(conflicts) - set(reviewed_conflicts))
+        if reviewed_conflicts:
+            self.issue(
+                "document_boundary_classification_reviewed_override",
+                "warning",
+                "Native Markdown boundary evidence was retained or explicitly excluded by the reviewed document/scope plan despite a live SDK false classification",
+                details={"record_count": len(reviewed_conflicts)},
+            )
+        if unresolved_conflicts:
             self.issue(
                 "document_boundary_classification_conflict",
                 "error",
                 "Live SDK classification disagrees with native Markdown boundary evidence",
-                details={"conflict_count": len(conflicts)},
+                details={"conflict_count": len(unresolved_conflicts)},
             )
-        if snapshot_only_boundaries:
+        reviewed_snapshot_only = [
+            rem_id for rem_id in snapshot_only_boundaries
+            if self._is_excluded(rem_id)
+            or (self.document_plan is not None and rem_id in self.document_plan)
+            or (
+                self.document_plan is not None
+                and self._nearest_full_boundary(rem_id) is not None
+            )
+        ]
+        unresolved_snapshot_only = sorted(set(snapshot_only_boundaries) - set(reviewed_snapshot_only))
+        if reviewed_snapshot_only:
+            self.issue(
+                "snapshot_boundary_reviewed_disposition",
+                "warning",
+                "Live-only document/folder classification has an explicit reviewed output-boundary or scope disposition",
+                details={"record_count": len(reviewed_snapshot_only)},
+            )
+        if unresolved_snapshot_only:
             self.issue(
                 "snapshot_boundary_missing_from_native_export",
                 "error",
                 "Live SDK reports document/folder records with no matched native Markdown file",
-                details={"record_count": len(snapshot_only_boundaries)},
+                details={"record_count": len(unresolved_snapshot_only)},
             )
 
     def _validate_snapshot_scope(self) -> None:
@@ -804,6 +1631,13 @@ class Converter:
                 self.issue("duplicate_id", "error", "Duplicate Rem ID", rem_id=rem_id)
                 continue
             self.index[rem_id] = raw
+        order = {rid: i for i, rid in enumerate(self.index)}
+        for rem_id, raw in self.index.items():
+            parent = raw.get("parent")
+            if isinstance(parent, str):
+                self.ownership_children[parent].append(rem_id)
+        for parent, ids in self.ownership_children.items():
+            ids.sort(key=lambda rid: (str(self.index[rid].get("f", "~")), order[rid]))
         if self.snapshot_contract is not None and isinstance(self.snapshot_contract.get("records"), dict):
             records = self.snapshot_contract["records"]
             ignored_export, ignored_snapshot = _generated_context_identity_exemptions(
@@ -830,13 +1664,11 @@ class Converter:
                     details={"parent_count": order_mismatches["child_order_unresolved"]},
                 )
         else:
-            order = {rid: i for i, rid in enumerate(self.index)}
-            for rem_id, raw in self.index.items():
-                parent = raw.get("parent")
-                if isinstance(parent, str):
-                    self.children[parent].append(rem_id)
-            for parent, ids in self.children.items():
-                ids.sort(key=lambda rid: (str(self.index[rid].get("f", "~")), order[rid]))
+            self.children.update({parent: list(ids) for parent, ids in self.ownership_children.items()})
+        self._prepare_exclusions()
+        self._prepare_reference_metadata()
+        self._validate_document_plan()
+        normalized_paths: dict[str, str] = {}
         for root in self.roots:
             if root not in self.index:
                 self.issue("missing_root", "error", "Requested root is absent from export", rem_id=root)
@@ -844,14 +1676,24 @@ class Converter:
             if self.index[root].get("type") == 6:
                 self.issue("portal_root_unsupported", "error", "A pilot root must be a source/document Rem, not a portal", rem_id=root, portal_id=root)
                 continue
+            if self._is_excluded(root):
+                continue
             if self.full_mode:
                 relative = PurePosixPath(self.requested_file_map[root])
                 if relative.is_absolute() or ".." in relative.parts or relative.suffix.lower() != ".md":
                     raise ExportError(f"unsafe full-export output path for {root!r}")
+                folded = unicodedata.normalize("NFKC", str(relative)).casefold()
+                if folded in normalized_paths:
+                    raise ExportError(
+                        f"duplicate full-export output path: {str(relative)!r} and {normalized_paths[folded]!r}"
+                    )
+                normalized_paths[folded] = str(relative)
                 self.files[root] = str(relative)
             else:
                 title = self.plain_rich(self.index[root].get("key")) or "Untitled"
                 self.files[root] = f"notes/{safe_stem(title, root)}.md"
+        if self.full_mode:
+            self._validate_retained_children_of_exact_exclusions()
         # Every explicit root owns its own canonical location, even when roots overlap.
         for root in self.roots:
             if root in self.files:
@@ -865,6 +1707,14 @@ class Converter:
 
     def _assign_canonical(self, rem_id: str, root: str, path: tuple[str, ...], seen: set[str]) -> None:
         if rem_id in seen or len(path) > self.max_depth:
+            return
+        if self._is_excluded(rem_id):
+            decision = self._scope_exclusions.get(rem_id)
+            if decision and decision["kind"] == "subtree":
+                return
+            next_seen = seen | {rem_id}
+            for child in self.children.get(rem_id, []):
+                self._assign_canonical(child, root, path + (rem_id,), next_seen)
             return
         if self.index[rem_id].get("type") == 6:
             return
@@ -920,6 +1770,17 @@ class Converter:
                 kind = part.get("i")
                 if kind == "q" and part.get("_id"):
                     target_id = str(part["_id"])
+                    metadata = (
+                        self.reference_metadata_index.resolve_reference(target_id)
+                        if self.reference_metadata_index is not None
+                        else None
+                    )
+                    if metadata is not None:
+                        result.append(f"{metadata.label} ({metadata.url})")
+                        continue
+                    if target_id in self._scope_exclusions:
+                        result.append("[excluded source]")
+                        continue
                     target = self.index.get(target_id)
                     if not target:
                         fallback = self._plain_rich(part.get("textOfDeletedRem"), seen_references).strip()
@@ -963,8 +1824,46 @@ class Converter:
             text = str(part.get("text", ""))
             if kind == "q" and part.get("_id"):
                 target_id = str(part["_id"])
+                metadata = (
+                    self.reference_metadata_index.resolve_reference(target_id)
+                    if self.reference_metadata_index is not None
+                    else None
+                )
+                if metadata is not None:
+                    rendered.append(f"[{_escape_markdown(metadata.label)}]({_url(metadata.url)})")
+                    self._materialized_reference_edges.add((owner_id, target_id))
+                    self._reference_materializations.append({
+                        "owner_id": owner_id,
+                        "target_id": target_id,
+                        "file": ctx.file,
+                        "portal_id": ctx.portal_id,
+                        "path": list(ctx.appearance_path),
+                        "provenance": dict(metadata.provenance),
+                    })
+                    continue
                 fallback_label = self._plain_rich(part.get("textOfDeletedRem"), set()).strip()
+                if target_id in self._scope_exclusions:
+                    rendered.append("[excluded source]")
+                    self.issue(
+                        "excluded_reference",
+                        "warning",
+                        "Reference target was intentionally excluded; no target text or link was emitted",
+                        rem_id=owner_id,
+                        path=ctx.appearance_path,
+                        details={"target_id": target_id},
+                    )
+                    continue
                 label = self.plain_rich(self.index.get(target_id, {}).get("key")) or fallback_label or target_id
+                if target_id in self._system_exclusions:
+                    rendered.append(_escape_markdown(label))
+                    self.issue(
+                        "system_reference_label_only",
+                        "warning",
+                        "Reference target is an SDK-classified system definition without a canonical note; its visible label was preserved",
+                        rem_id=target_id,
+                        details={"target_id": target_id},
+                    )
+                    continue
                 target = self.canonical.get(target_id)
                 if target:
                     self._referenced_canonical.add(target_id)
@@ -1000,6 +1899,16 @@ class Converter:
                 if not isinstance(source, str) or not source:
                     rendered.append("[image unavailable]")
                     self.issue("image_without_url", "warning", "Image object has no URL", rem_id=owner_id, path=ctx.appearance_path)
+                    continue
+                if source in self.asset_omissions:
+                    label = str(part.get("alt") or part.get("title") or "image").strip() or "image"
+                    rendered.append(f"[Image unavailable: {_escape_markdown(label)}]({_url(source)})")
+                    self._asset_omission_occurrences[source].append({
+                        "rem_id": owner_id,
+                        "file": ctx.file,
+                        "portal_id": ctx.portal_id,
+                        "path": list(ctx.appearance_path),
+                    })
                     continue
                 parsed = urllib.parse.urlparse(source)
                 if parsed.scheme not in {"http", "https"}:
@@ -1163,6 +2072,24 @@ class Converter:
         return targets
 
     def _visibility(self, portal_id: str, target_id: str, raw_portal: dict[str, Any], ctx: RenderContext) -> bool:
+        if self.portal_evidence is not None:
+            plan = self.portal_evidence["plans"].get(portal_id)
+            states = plan.get("visibility_contexts", {}).get(portal_id, {}) if isinstance(plan, dict) else {}
+            state = states.get(target_id)
+            if state == "hidden":
+                return False
+            if state in {"none", "included", "root"}:
+                return True
+            self.issue(
+                "portal_evidence_visibility_missing",
+                "error",
+                "Installed portal evidence lacks a resolved visibility state for rendered content",
+                rem_id=target_id,
+                portal_id=portal_id,
+                path=ctx.appearance_path,
+                details={"state": state},
+            )
+            return False
         override_config = self.visibility_overrides.get(portal_id)
         overrides: dict[str, Any] = {}
         if override_config is not None:
@@ -1200,6 +2127,17 @@ class Converter:
             body = f"{_escape_markdown(label)} (cycle stopped)"
         return f"{'  ' * level}- {body}"
 
+    @staticmethod
+    def _bullet_lines(text: str, level: int, anchor: str) -> list[str]:
+        prefix = "  " * level
+        if "\n" in text:
+            parts = text.splitlines()
+            lines = [f"{prefix}- {parts[0] or '  '}"]
+            lines.extend(f"{prefix}  {part}" for part in parts[1:])
+            lines.append(f"{prefix}  ^{anchor}")
+            return lines
+        return [f"{prefix}- {text or '[empty]'} ^{anchor}"]
+
     def _render_node(self, rem_id: str, level: int, ctx: RenderContext, kind: str) -> list[str]:
         if self._budget_reported:
             return []
@@ -1209,12 +2147,29 @@ class Converter:
         if rem_id not in self.index:
             self.issue("missing_target", "error", "Portal or ownership target is absent", rem_id=rem_id, portal_id=ctx.portal_id, path=ctx.appearance_path)
             return []
+        if (
+            any(component.startswith("automatic-row:") for component in ctx.appearance_path)
+            and rem_id not in self._automatic_row_cell_ids
+        ):
+            return []
+        early_exclusion = self._scope_exclusions.get(rem_id)
+        if early_exclusion and early_exclusion["kind"] == "subtree":
+            return []
         if rem_id in ctx.source_path:
             self.issue("cycle", "warning", "Recursive branch stopped at a per-path cycle", rem_id=rem_id, portal_id=ctx.portal_id, path=ctx.appearance_path)
             return [self._cycle_line(rem_id, level, ctx)]
         raw = self.index[rem_id]
         next_ctx = RenderContext(ctx.file, ctx.root_id, ctx.portal_id, ctx.source_path + (rem_id,), ctx.appearance_path + (rem_id,))
+        if self._is_excluded(rem_id):
+            lines: list[str] = []
+            for child in self.children.get(rem_id, []):
+                lines.extend(self._render_node(child, level, next_ctx, kind))
+            return lines
         if ctx.portal_id and not self._visibility(ctx.portal_id, rem_id, self.index[ctx.portal_id], ctx):
+            return []
+        if raw.get("type") == 6 and any(
+            component.startswith("automatic-row:") for component in ctx.appearance_path
+        ):
             return []
         if raw.get("type") == 6:
             return self._render_portal(rem_id, raw, level, next_ctx)
@@ -1232,30 +2187,213 @@ class Converter:
         if value:
             text = f"{text} — {value}" if text else value
         context = f"{kind}:{ctx.root_id}:{ctx.portal_id or ''}:{'/'.join(next_ctx.appearance_path)}"
-        if kind == "canonical" and self.canonical.get(rem_id, {}).get("file") == ctx.file:
+        if (
+            kind == "portal-copy"
+            and self._portal_canonical_owners.get(rem_id) == ctx.portal_id
+            and rem_id not in self._rendered_portal_canonical
+        ):
+            kind = "portal-source-canonical"
+        if kind in {"canonical", "portal-source-canonical"} and self.canonical.get(rem_id, {}).get("file") == ctx.file:
             anchor = self.canonical[rem_id]["anchor"]
         else:
             anchor = stable_anchor(rem_id, context)
         if not self._record_occurrence(rem_id, next_ctx, anchor, kind, text):
             return []
-        prefix = "  " * level
-        if "\n" in text:
-            parts = text.splitlines()
-            lines = [f"{prefix}- {parts[0] or '  '}"]
-            lines.extend(f"{prefix}  {part}" for part in parts[1:])
-            lines.append(f"{prefix}  ^{anchor}")
-        else:
-            lines = [f"{prefix}- {text or '[empty]'} ^{anchor}"]
+        if kind == "portal-source-canonical":
+            self._rendered_portal_canonical.add(rem_id)
+        lines = self._bullet_lines(text, level, anchor)
         for child in self.children.get(rem_id, []):
             lines.extend(self._render_node(child, level + 1, next_ctx, "portal-copy" if ctx.portal_id else "canonical"))
         return lines
 
     def _render_portal(self, portal_id: str, raw: dict[str, Any], level: int, ctx: RenderContext) -> list[str]:
+        if self.portal_evidence is not None:
+            plan = self.portal_evidence["plans"][portal_id]
+            lines: list[str] = []
+            if plan["kind"] == "ordinary-content":
+                for appearance in plan["appearances"]:
+                    context_id = appearance["context_portal_id"]
+                    portal_ctx = RenderContext(
+                        ctx.file,
+                        ctx.root_id,
+                        context_id,
+                        ctx.source_path,
+                        ctx.appearance_path + (f"portal:{portal_id}",),
+                    )
+                    lines.extend(self._render_node(appearance["anchor_id"], level, portal_ctx, "portal-copy"))
+                return lines
+            for appearance in plan["appearances"]:
+                lines.extend(self._render_automatic_match(portal_id, appearance, level, ctx))
+            if plan["kind"] == "flat-search":
+                lines.extend(self._render_table_schema(portal_id, plan, level, ctx))
+            return lines
         lines = []
         targets = self._portal_targets(portal_id, raw, ctx)
         for target_id in targets:
             portal_ctx = RenderContext(ctx.file, ctx.root_id, portal_id, ctx.source_path, ctx.appearance_path + (f"portal:{portal_id}",))
             lines.extend(self._render_node(target_id, level, portal_ctx, "portal-copy"))
+        return lines
+
+    def _render_table_schema(
+        self,
+        portal_id: str,
+        plan: dict[str, Any],
+        level: int,
+        ctx: RenderContext,
+    ) -> list[str]:
+        schema_roots = plan.get("table_schema_roots", [])
+        omitted_wrappers = plan.get("omitted_empty_table_schema_wrappers", [])
+        if not schema_roots and not omitted_wrappers:
+            return []
+        prefix = "  " * level
+        lines = [f"{prefix}- **Columns**"]
+        schema_ctx = RenderContext(
+            ctx.file,
+            ctx.root_id,
+            portal_id,
+            ctx.source_path,
+            ctx.appearance_path + (f"portal:{portal_id}", "table-schema"),
+        )
+        for schema in schema_roots:
+            wrapper_id = schema["wrapper_id"]
+            lines.extend(self._render_evidenced_record(wrapper_id, level + 1, schema_ctx, portal_id))
+            wrapper_ctx = RenderContext(
+                schema_ctx.file,
+                schema_ctx.root_id,
+                schema_ctx.portal_id,
+                schema_ctx.source_path + (wrapper_id,),
+                schema_ctx.appearance_path + (wrapper_id,),
+            )
+            for label_id in schema["ordered_label_ids"]:
+                lines.extend(self._render_evidenced_record(label_id, level + 2, wrapper_ctx, portal_id))
+        for schema in omitted_wrappers:
+            for label_id in schema["promoted_label_ids"]:
+                lines.extend(self._render_evidenced_record(label_id, level + 1, schema_ctx, portal_id))
+        return lines
+
+    def _render_evidenced_record(
+        self,
+        rem_id: str,
+        level: int,
+        ctx: RenderContext,
+        portal_id: str,
+    ) -> list[str]:
+        raw = self.index[rem_id]
+        next_ctx = RenderContext(
+            ctx.file,
+            ctx.root_id,
+            portal_id,
+            ctx.source_path + (rem_id,),
+            ctx.appearance_path + (rem_id,),
+        )
+        text = self.render_rich(raw.get("key"), next_ctx, rem_id)
+        value = self.render_rich(raw.get("value"), next_ctx, rem_id)
+        if value:
+            text = f"{text} — {value}" if text else value
+        canonical = self.canonical[rem_id]
+        if self._portal_canonical_owners.get(rem_id) == portal_id and rem_id not in self._rendered_portal_canonical:
+            anchor = canonical["anchor"]
+            kind = "portal-source-canonical"
+        else:
+            anchor = stable_anchor(rem_id, f"portal-schema:{portal_id}:{'/'.join(next_ctx.appearance_path)}")
+            kind = "portal-schema"
+        if not self._record_occurrence(rem_id, next_ctx, anchor, kind, text):
+            return []
+        if kind == "portal-source-canonical":
+            self._rendered_portal_canonical.add(rem_id)
+        return self._bullet_lines(text, level, anchor)
+
+    def _render_automatic_match(
+        self,
+        portal_id: str,
+        appearance: dict[str, Any],
+        level: int,
+        ctx: RenderContext,
+    ) -> list[str]:
+        rem_id = appearance["anchor_id"]
+        if rem_id not in self.index or self._is_excluded(rem_id):
+            self.issue(
+                "automatic_portal_anchor_unavailable",
+                "error",
+                "Evidenced automatic-view anchor is unavailable after scope processing",
+                rem_id=rem_id,
+                portal_id=portal_id,
+                path=ctx.appearance_path,
+            )
+            return []
+        next_ctx = RenderContext(
+            ctx.file,
+            ctx.root_id,
+            portal_id,
+            ctx.source_path + (rem_id,),
+            ctx.appearance_path + (
+                f"portal:{portal_id}",
+                f"context:{appearance['context_portal_id']}",
+                rem_id,
+            ),
+        )
+        raw = self.index[rem_id]
+        text = self.render_rich(raw.get("key"), next_ctx, rem_id)
+        value = self.render_rich(raw.get("value"), next_ctx, rem_id)
+        if value:
+            text = f"{text} — {value}" if text else value
+        canonical = self.canonical.get(rem_id)
+        if canonical is None:
+            self.issue(
+                "automatic_portal_anchor_without_canonical",
+                "error",
+                "Automatic-view match has no canonical output target",
+                rem_id=rem_id,
+                portal_id=portal_id,
+                path=next_ctx.appearance_path,
+            )
+            return []
+        path_ids = appearance.get("canonical_source_path_ids")
+        if not isinstance(path_ids, list) or not path_ids or path_ids[-1] != rem_id:
+            self.issue(
+                "automatic_portal_source_path_invalid",
+                "error",
+                "Automatic-view match lacks its evidenced canonical source path",
+                rem_id=rem_id,
+                portal_id=portal_id,
+                path=next_ctx.appearance_path,
+            )
+            return []
+        labels = [
+            self.plain_rich(self.index[path_id].get("key")).strip()
+            for path_id in path_ids[:-1]
+            if path_id in self.index and not self._is_excluded(path_id)
+        ]
+        labels = [label for label in labels if label]
+        final_label = self.plain_rich(raw.get("key")).strip() or rem_id
+        source_link = f"[[{canonical['file']}#^{canonical['anchor']}|{_escape_markdown(final_label)}]]"
+        source_path = " / ".join([*(_escape_markdown(label) for label in labels), source_link])
+        occurrence_kind = "portal-match"
+        if self._portal_canonical_owners.get(rem_id) == portal_id and rem_id not in self._rendered_portal_canonical:
+            anchor = canonical["anchor"]
+            occurrence_kind = "portal-source-canonical"
+        else:
+            anchor = stable_anchor(rem_id, f"portal-match:{portal_id}:{'/'.join(next_ctx.appearance_path)}")
+            self._referenced_canonical.add(rem_id)
+        occurrence_text = f"{text}\nSource: {source_path}"
+        if not self._record_occurrence(rem_id, next_ctx, anchor, occurrence_kind, occurrence_text):
+            return []
+        if occurrence_kind == "portal-source-canonical":
+            self._rendered_portal_canonical.add(rem_id)
+        lines = self._bullet_lines(text, level, anchor)
+        prefix = "  " * level
+        lines.append(f"{prefix}  Source: {source_path}")
+        if self.index[rem_id].get("type") == 1:
+            row_ctx = RenderContext(
+                next_ctx.file,
+                next_ctx.root_id,
+                next_ctx.portal_id,
+                next_ctx.source_path,
+                next_ctx.appearance_path + (f"automatic-row:{rem_id}",),
+            )
+            for child_id in self.children.get(rem_id, []):
+                if child_id in self._automatic_row_cell_ids:
+                    lines.extend(self._render_node(child_id, level + 1, row_ctx, "portal-copy"))
         return lines
 
     def _nearest_full_boundary(self, rem_id: str) -> str | None:
@@ -1299,7 +2437,21 @@ class Converter:
                 "canonical": source.get("canonical") if source else None,
                 "occurrence_count": len(source.get("occurrences", [])) if source else 0,
             }
-            if rem_id in self._generated_context_export_ids:
+            if rem_id in self._system_exclusions:
+                entry.update(
+                    disposition="excluded_system_definition",
+                    reason="Per-record live SDK methods positively classified this exact record as a RemNote system definition; classification was not propagated to children.",
+                    system_definition_evidence=self._system_exclusions[rem_id],
+                )
+                if rem_id in self._scope_exclusions:
+                    entry["scope_exclusion"] = self._scope_exclusions[rem_id]
+            elif rem_id in self._scope_exclusions:
+                entry.update(
+                    disposition="excluded_by_scope",
+                    reason="User-approved source scope excluded this identity from canonical output, portal copies, assets, and retrieval.",
+                    scope_exclusion=self._scope_exclusions[rem_id],
+                )
+            elif rem_id in self._generated_context_export_ids:
                 entry.update(
                     disposition="excluded_generated_search_context",
                     reason="Paired export/snapshot/runtime evidence identifies this empty type-6 record as a replaced generated search-context node.",
@@ -1322,12 +2474,21 @@ class Converter:
                         reason="Portal output has one or more structured error issues; cached search results were not trusted.",
                     )
                 else:
-                    entry.update(
-                        disposition="expanded_portal",
-                        reason="Portal definition was represented by physical copied source occurrences.",
-                    )
+                    if self.portal_evidence is not None and rem_id not in self._active_portal_ids:
+                        entry.update(
+                            disposition="evidenced_automatic_context_portal",
+                            reason="Portal is an evidenced nested automatic-view context; the approved match-only parent plan represents its result without recursively rendering the context wrapper.",
+                        )
+                    else:
+                        entry.update(
+                            disposition="expanded_portal",
+                            reason="Portal definition was represented by physical copied source occurrences.",
+                        )
             elif source and source["occurrences"]:
-                canonical_rendered = any(item["kind"] == "canonical" for item in source["occurrences"])
+                canonical_rendered = any(
+                    item["kind"] in {"canonical", "portal-source-canonical"}
+                    for item in source["occurrences"]
+                )
                 source_title = self.plain_rich(raw.get("key")).strip().lower()
                 if source_title.endswith(".pdf"):
                     disposition = "included_pdf_text_container"
@@ -1342,6 +2503,21 @@ class Converter:
                     disposition = "included_portal_only"
                     reason = "Source is outside native document ownership but has one or more explicit portal appearances."
                 entry.update(disposition=disposition, reason=reason)
+            elif rem_id in self._empty_table_schema_wrapper_ids:
+                entry.update(
+                    disposition="omitted_empty_table_schema_wrapper",
+                    reason="Signed portal evidence proved this table-schema wrapper has no authored key/value, no inbound rich-text references, and only promoted authored label children.",
+                )
+            elif rem_id in self._portal_hidden_omitted_ids:
+                entry.update(
+                    disposition="omitted_explicitly_hidden_portal_content",
+                    reason="Live portal visibility evidence explicitly marked this portal-local branch hidden; the source identity remains available wherever it has a separate canonical occurrence.",
+                )
+            elif rem_id in self._automatic_policy_omitted_ids:
+                entry.update(
+                    disposition="omitted_by_automatic_match_policy",
+                    reason="The explicit user-approved automatic-view policy preserves the matched bullet and canonical source path/link without recursively copying its descendants.",
+                )
             elif owner is None:
                 if self._is_evidenced_system_definition(rem_id):
                     entry.update(
@@ -1462,6 +2638,24 @@ class Converter:
             destination = output / relative
             if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() != item["sha256"]:
                 raise ExportError(f"refusing to overwrite modified generated file: {item['path']}")
+        for section_name in (
+            "snapshot_contract",
+            "portal_evidence",
+            "source_comparison_receipt",
+        ):
+            section = prior.get(section_name)
+            if not isinstance(section, dict):
+                continue
+            sidecar = section.get("sidecar")
+            expected_sha = section.get("sha256")
+            if not isinstance(sidecar, str) or not isinstance(expected_sha, str):
+                continue
+            relative = PurePosixPath(sidecar)
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ExportError(f"existing output manifest contains an unsafe {section_name} sidecar path")
+            destination = output / relative
+            if destination.exists() and hashlib.sha256(destination.read_bytes()).hexdigest() != expected_sha:
+                raise ExportError(f"refusing to overwrite modified generated sidecar: {sidecar}")
         return prior
 
     def _remove_stale_generated_files(
@@ -1540,6 +2734,41 @@ class Converter:
             canonical = self.canonical[rem_id]
             if (canonical["file"], canonical["anchor"]) not in rendered_targets:
                 self.issue("dangling_canonical_reference", "error", "Rendered reference points to a canonical target stopped by a pilot limit", rem_id=rem_id, details=canonical)
+        excluded_ids = set(self._scope_exclusions) | set(self._system_exclusions)
+        leaked_sources = sorted(excluded_ids & set(self.source_map))
+        leaked_asset_occurrences = sorted({
+            occurrence.get("rem_id")
+            for asset in self.assets.values()
+            for occurrence in asset.get("occurrences", [])
+            if isinstance(occurrence, dict) and occurrence.get("rem_id") in excluded_ids
+        })
+        if leaked_sources or leaked_asset_occurrences:
+            self.issue(
+                "scope_exclusion_leak",
+                "error",
+                "Excluded identities appeared in rendered source or asset output",
+                details={
+                    "source_count": len(leaked_sources),
+                    "asset_occurrence_source_count": len(leaked_asset_occurrences),
+                },
+            )
+        reference_metadata_report = self._reference_metadata_report()
+        for source in sorted(set(self.asset_omissions) - set(self._asset_omission_occurrences)):
+            self.issue(
+                "configured_asset_omission_unused",
+                "error",
+                "Configured unavailable-asset evidence did not match any rendered image occurrence",
+                details={"source": source},
+            )
+        asset_omission_report = {
+            source: {
+                "reason": self.asset_omissions[source],
+                "occurrences": occurrences,
+                "occurrence_count": len(occurrences),
+                "rendering": "external-unavailable-marker",
+            }
+            for source, occurrences in sorted(self._asset_omission_occurrences.items())
+        }
         record_ledger = self._build_full_record_ledger() if self.full_mode else None
         disposition_counts = Counter(item["disposition"] for item in record_ledger.values()) if record_ledger else Counter()
         manifest = {
@@ -1569,10 +2798,44 @@ class Converter:
                 "portal_snapshots": self.portal_snapshots,
                 "visibility_overrides": self.visibility_overrides,
                 "split_candidates": self.split_candidates,
+                "exclude_subtree_roots": self.exclude_subtree_roots,
+                "exclude_source_ids": self.exclude_source_ids,
+                "document_plan": self.document_plan,
+                "reference_metadata": self.reference_metadata_config,
+                "asset_omissions": self.asset_omissions,
             },
             "files": written_files,
             "source_map": self.source_map,
             "assets": self.assets,
+            "reference_metadata": reference_metadata_report,
+            "asset_omissions": asset_omission_report,
+            "portal_evidence": (
+                {
+                    "schema_version": self.portal_evidence.get("schema_version"),
+                    "sidecar": "portal-evidence.json",
+                    "sha256": hashlib.sha256(
+                        (json.dumps(self.portal_evidence, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode("utf-8")
+                    ).hexdigest(),
+                    "binding": self.portal_evidence.get("binding"),
+                    "render_policy": self.portal_evidence.get("render_policy"),
+                    "coverage": self.portal_evidence.get("coverage"),
+                    "diagnostics": self.portal_evidence.get("diagnostics"),
+                }
+                if self.portal_evidence is not None
+                else {"status": "not_supplied"}
+            ),
+            "source_comparison_receipt": (
+                {
+                    "schema_version": self.source_comparison_receipt.get("schema_version")
+                    or self.source_comparison_receipt.get("report_schema"),
+                    "sidecar": "source-comparison-receipt.json",
+                    "sha256": self.source_comparison_receipt_sha256,
+                    "decision": self.source_comparison_receipt.get("decision"),
+                    "strict_comparison": self.source_comparison_receipt.get("strict_comparison"),
+                }
+                if self.source_comparison_receipt is not None
+                else {"status": "not_supplied"}
+            ),
             "issues": self.issues,
             "counts": {
                 "raw_records": len(self.payload.get("docs", [])),
@@ -1580,12 +2843,26 @@ class Converter:
                 "occurrences": self._occurrences,
                 "sources": len(self.source_map),
                 "assets": len(self.assets),
+                "asset_omissions": len(asset_omission_report),
+                "asset_omission_occurrences": sum(
+                    item["occurrence_count"] for item in asset_omission_report.values()
+                ),
                 "issues": len(self.issues),
+                "scope_excluded_records": len(self._scope_exclusions),
+                "system_definition_records": len(self._system_exclusions),
+                "excluded_records": len(excluded_ids),
                 "record_dispositions": dict(sorted(disposition_counts.items())),
             },
         }
         if self.full_mode:
             manifest["document_boundaries"] = self.boundary_evidence
+            manifest["output_document_plan"] = {
+                "mode": "explicit_full_map" if self.document_plan is not None else "native_boundaries",
+                "boundary_count": len(self.files),
+                "native_boundary_count": len(self.native_file_map),
+                "added_boundary_ids": sorted(set(self.files) - set(self.native_file_map)),
+                "removed_boundary_ids": sorted(set(self.native_file_map) - set(self.files)),
+            }
             manifest["record_ledger"] = record_ledger
             manifest["omissions"] = {
                 "pdf_binaries": "Not present in the .rem archive and intentionally not copied; readable source text remains included.",
@@ -1656,6 +2933,41 @@ def main(argv: list[str] | None = None) -> int:
             for rem_id, evidence in split_candidates.items()
         ):
             raise ExportError("config.split_candidates must map Rem IDs to non-empty evidence strings")
+        exclusion_fields: dict[str, dict[str, str]] = {}
+        for field in ("exclude_subtree_roots", "exclude_source_ids"):
+            value = config.get(field) or {}
+            if not isinstance(value, dict) or any(
+                not isinstance(rem_id, str)
+                or not rem_id
+                or not isinstance(reason, str)
+                or not reason.strip()
+                for rem_id, reason in value.items()
+            ):
+                raise ExportError(f"config.{field} must map non-empty Rem IDs to non-empty reasons")
+            exclusion_fields[field] = value
+        document_plan = config.get("document_plan") if "document_plan" in config else None
+        if document_plan is not None and not isinstance(document_plan, dict):
+            raise ExportError("config.document_plan must map Rem IDs to path/evidence objects")
+        reference_metadata_config = config.get("reference_metadata") if "reference_metadata" in config else None
+        if reference_metadata_config is not None and not isinstance(reference_metadata_config, dict):
+            raise ExportError("config.reference_metadata must be an object")
+        asset_omissions = config.get("asset_omissions") or {}
+        if not isinstance(asset_omissions, dict):
+            raise ExportError("config.asset_omissions must map asset URLs to reviewed reasons")
+        portal_evidence_config = config.get("portal_evidence") if "portal_evidence" in config else None
+        if portal_evidence_config is not None:
+            if not isinstance(portal_evidence_config, dict):
+                raise ExportError("config.portal_evidence must be an object")
+            if (
+                not isinstance(portal_evidence_config.get("evidence"), str)
+                or not portal_evidence_config["evidence"].strip()
+            ):
+                raise ExportError("config.portal_evidence requires non-empty evidence")
+            reviewed_receipt_path = portal_evidence_config.get("source_comparison_receipt")
+            if reviewed_receipt_path is not None and (
+                not isinstance(reviewed_receipt_path, str) or not reviewed_receipt_path
+            ):
+                raise ExportError("config.portal_evidence.source_comparison_receipt must be a non-empty path")
         configured_kb_id = config.get("knowledgebase_id")
         if configured_kb_id is not None and (not isinstance(configured_kb_id, str) or not configured_kb_id.strip()):
             raise ExportError("config.knowledgebase_id must be a non-empty string")
@@ -1698,10 +3010,61 @@ def main(argv: list[str] | None = None) -> int:
             snapshot_contract_sha256=contract_sha256,
             knowledgebase_id=configured_kb_id,
             split_candidates=split_candidates,
+            exclude_subtree_roots=exclusion_fields["exclude_subtree_roots"],
+            exclude_source_ids=exclusion_fields["exclude_source_ids"],
+            document_plan=document_plan,
+            reference_metadata=reference_metadata_config,
+            asset_omissions=asset_omissions,
         )
+        portal_evidence_result = None
+        source_receipt = None
+        source_receipt_sha256 = None
+        if portal_evidence_config is not None:
+            if not full_mode or contract is None or snapshot_path is None or contract_sha256 is None:
+                raise ExportError("config.portal_evidence requires full mode and a validated snapshot contract")
+            reviewed_receipt_sha256 = None
+            if portal_evidence_config.get("source_comparison_receipt"):
+                _, reviewed_receipt_sha256 = load_source_comparison_receipt(
+                    Path(portal_evidence_config["source_comparison_receipt"]),
+                    raw_export_sha256=fingerprint,
+                    snapshot_file_sha256=contract_sha256,
+                    record_count=len(payload["docs"]),
+                )
+            source_receipt, source_receipt_sha256 = create_source_comparison_receipt(
+                payload,
+                fingerprint,
+                contract,
+                contract_sha256,
+                reviewed_receipt_sha256=reviewed_receipt_sha256,
+            )
+            locations = converter.admitted_portal_locations()
+            portal_evidence_result = derive_portal_evidence(
+                contract,
+                converter.index,
+                locations,
+                set(converter._scope_exclusions) | set(converter._system_exclusions),
+                raw_export_sha256=fingerprint,
+                scope_policy_sha256=converter.scope_policy_sha256,
+                source_comparison_receipt_sha256=source_receipt_sha256,
+                expected_knowledgebase_id=converter.knowledgebase_id,
+            )
+            converter.install_portal_evidence(
+                portal_evidence_result,
+                source_comparison_receipt=source_receipt,
+                source_comparison_receipt_sha256=source_receipt_sha256,
+            )
         manifest = converter.convert(args.output)
         if full_mode and contract is not None and snapshot_path is not None:
             (args.output / "snapshot-contract.json").write_bytes(snapshot_path.read_bytes())
+        if portal_evidence_result is not None and source_receipt is not None:
+            (args.output / "portal-evidence.json").write_text(
+                json.dumps(portal_evidence_result, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            (args.output / "source-comparison-receipt.json").write_text(
+                json.dumps(source_receipt, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
     except (OSError, ExportError, ValueError) as exc:
         print(f"remnote_export: {exc}", file=sys.stderr)
         return 2
