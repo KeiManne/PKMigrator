@@ -37,6 +37,12 @@ migration** probes every portal, gives selected portals priority, and exposes bo
 the UI. Progress reports portal count and probes used. **Cancel** stops after the pending SDK call
 and prevents download.
 
+Complete mode collects evidence for every portal; it does not certify that the migration is
+complete. Validation checkboxes can remain unchecked during collection. Compare the downloaded
+evidence with the source export and live UI before constructing an accepted migration contract.
+Keep source editing paused between a fresh structured export and its corresponding snapshot;
+the SDK has no transactional export guarantee, so record identity must still be checked afterward.
+
 The single file input accepts the converter's `document-candidates.json` (`records[].rem_id`) or:
 
 ```json
@@ -80,6 +86,9 @@ false even when its diagnostic getter call succeeds.
 
 Each portal retains direct members in SDK return order, the document/portal context array,
 runtime visibility states, collapse, ordinary/visible positions, and search/backlink metadata.
+For a resolved type-6 Rem, a successful absent portal-type value is the host's default ordinary
+portal type. Failed calls remain errors. Built-in backlink properties are read as rich text;
+only an unambiguous Rem reference establishes the target identity, never its display label.
 The host can return `hidden`, `included`, `root`, `tab_included`, `none`, or `undefined` from its
 visibility getter. A successful `undefined` response means no explicit local state and is
 normalized to `none`, with its raw representation retained. Failed calls and unresolved Rems

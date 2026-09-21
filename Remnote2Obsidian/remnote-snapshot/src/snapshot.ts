@@ -10,7 +10,7 @@ const PORTAL_TYPE = {
 
 export const SNAPSHOT_SCHEMA_VERSION = 'remnote-migration-snapshot/v1' as const;
 export const SDK_VERSION = '0.0.46';
-export const PLUGIN_VERSION = '0.1.1';
+export const PLUGIN_VERSION = '0.1.2';
 
 export type Progress = (message: string) => void;
 export type HiddenState = 'hidden' | 'included' | 'root' | 'tab_included' | 'none';
@@ -48,7 +48,7 @@ export interface SnapshotRem {
   readonly text: RichTextInterface | undefined;
   readonly backText?: RichTextInterface;
   getChildrenRem?(): Promise<SnapshotRem[]>;
-  getPortalType(): Promise<number>;
+  getPortalType(): Promise<number | undefined>;
   getPortalDirectlyIncludedRem(): Promise<SnapshotRem[]>;
   allRemInDocumentOrPortal(): Promise<SnapshotRem[]>;
   isCollapsed(portalId: string): Promise<boolean>;
@@ -57,7 +57,6 @@ export interface SnapshotRem {
   getHiddenExplicitlyIncludedState?: (
     portalId?: string,
   ) => Promise<HiddenState | undefined>;
-  getPowerupPropertyAsRem(powerupCode: string, slotCode: string): Promise<SnapshotRem | undefined>;
   getPowerupPropertyAsRichText(powerupCode: string, slotCode: string): Promise<RichTextInterface>;
   remsReferencingThis(): Promise<SnapshotRem[]>;
   isDocument(): Promise<boolean>;
@@ -136,6 +135,11 @@ export interface RuntimeReturnedRecord {
 export interface PortalRecord {
   portal_id: string;
   portal_type: number | null;
+  portal_type_raw: number | 'undefined' | 'unknown';
+  portal_type_contract: {
+    source: 'public-host-implementation-and-sdk-enum';
+    resolved_undefined_means: 'portal';
+  };
   portal_type_name: string;
   membership: {
     complete: boolean;
@@ -204,6 +208,13 @@ export interface PortalRecord {
     root_result_complete: boolean;
     root_result_order: 'visible-sibling-position' | null;
     root_result_blockers: string[];
+    backlink_target_rich_text: RichTextInterface | null;
+    backlink_target_resolution:
+      | 'absent'
+      | 'single-reference'
+      | 'ambiguous'
+      | 'method-unavailable'
+      | 'failed';
     backlink_target_id: string | null;
     query: RichTextInterface | null;
     filter: RichTextInterface | null;
@@ -373,7 +384,6 @@ const API_METHODS = [
   'Rem.allRemInDocumentOrPortal',
   'Rem.getHiddenExplicitlyIncludedState',
   'Rem.isCollapsed',
-  'Rem.getPowerupPropertyAsRem',
   'Rem.getPowerupPropertyAsRichText',
   'Rem.remsReferencingThis',
   'Rem.isDocument',
@@ -995,9 +1005,28 @@ export async function buildSnapshot(
     const captureTime = new Date().toISOString();
 
     let portalType: number | null = null;
+    let portalTypeRaw: number | 'undefined' | 'unknown' = 'unknown';
     try {
-      portalType = await portal.getPortalType();
+      const runtimePortalType: unknown = await portal.getPortalType();
       throwIfAborted(options.signal);
+      if (runtimePortalType === undefined) {
+        // The host omits the portal-type property for the default ordinary portal.
+        portalTypeRaw = 'undefined';
+        portalType = PORTAL_TYPE.PORTAL;
+      } else if (typeof runtimePortalType === 'number' && Number.isInteger(runtimePortalType)) {
+        portalTypeRaw = runtimePortalType;
+        portalType = runtimePortalType;
+      } else {
+        portalErrorIds.push(
+          addError({
+            severity: 'error',
+            scope: 'portal',
+            operation: 'Rem.getPortalType.runtime-value',
+            portal_id: portal._id,
+            message: `Host returned an unsupported portal type: ${JSON.stringify(runtimePortalType)}.`,
+          }),
+        );
+      }
     } catch (error) {
       rethrowAbort(error);
       portalErrorIds.push(
@@ -1465,6 +1494,9 @@ export async function buildSnapshot(
     let automaticView: PortalRecord['automatic_view'] = null;
     if (portalType === PORTAL_TYPE.SEARCH_PORTAL) {
       let backlinkTarget: SnapshotRem | undefined;
+      let backlinkTargetId: string | null = null;
+      let backlinkTargetRichText: RichTextInterface | null = null;
+      let backlinkTargetResolution: NonNullable<PortalRecord['automatic_view']>['backlink_target_resolution'] = 'absent';
       let query: RichTextInterface | null = null;
       let filter: RichTextInterface | null = null;
       let dontIncludeNested: RichTextInterface | null = null;
@@ -1483,6 +1515,9 @@ export async function buildSnapshot(
         ],
       ] as const) {
         try {
+          if (typeof portal.getPowerupPropertyAsRichText !== 'function') {
+            throw new Error('Rem.getPowerupPropertyAsRichText is unavailable on this runtime Rem object.');
+          }
           setter(await portal.getPowerupPropertyAsRichText('sp', slot));
           throwIfAborted(options.signal);
         } catch (error) {
@@ -1499,31 +1534,104 @@ export async function buildSnapshot(
           );
         }
       }
-      try {
-        backlinkTarget = await portal.getPowerupPropertyAsRem(
-          'sp',
-          'AutomaticBacklinkSearchPortalFor',
-        );
-        if (backlinkTarget) {
-          rememberRuntimeRem(backlinkTarget, `portal:${portal._id}:backlink-target`);
-        }
-        throwIfAborted(options.signal);
-      } catch (error) {
-        rethrowAbort(error);
+      if (typeof portal.getPowerupPropertyAsRichText !== 'function') {
+        backlinkTargetResolution = 'method-unavailable';
         automaticViewComplete = false;
         portalErrorIds.push(
           addError({
             severity: 'warning',
             scope: 'portal',
-            operation: 'SearchPortal.AutomaticBacklinkSearchPortalFor',
+            operation: 'SearchPortal.AutomaticBacklinkSearchPortalFor.unavailable',
             portal_id: portal._id,
-            message: errorMessage(error),
+            message: 'Rem.getPowerupPropertyAsRichText is unavailable on this runtime Rem object.',
           }),
         );
+      } else {
+        try {
+          const backlinkRichText = await portal.getPowerupPropertyAsRichText(
+            'sp',
+            'AutomaticBacklinkSearchPortalFor',
+          );
+          throwIfAborted(options.signal);
+          if (backlinkRichText == null) {
+            backlinkTargetRichText = null;
+          } else if (!Array.isArray(backlinkRichText)) {
+            backlinkTargetResolution = 'ambiguous';
+            automaticViewComplete = false;
+            portalErrorIds.push(
+              addError({
+                severity: 'warning',
+                scope: 'portal',
+                operation: 'SearchPortal.AutomaticBacklinkSearchPortalFor.runtime-value',
+                portal_id: portal._id,
+                message: `Host returned non-array rich text: ${JSON.stringify(backlinkRichText)}.`,
+              }),
+            );
+          } else {
+            backlinkTargetRichText = cloneRichText(backlinkRichText);
+          }
+          if (Array.isArray(backlinkRichText) && backlinkRichText.length > 0) {
+            const referenceItems = backlinkRichText.filter(
+              (item): item is { i: 'q'; _id: string } =>
+                typeof item === 'object' &&
+                item !== null &&
+                item.i === 'q' &&
+                typeof item._id === 'string' &&
+                item._id.length > 0,
+            );
+            const referenceIds = [...new Set(referenceItems.map((item) => item._id))];
+            if (referenceIds.length === 1) {
+              backlinkTargetResolution = 'single-reference';
+              backlinkTargetId = referenceIds[0];
+              backlinkTarget = await resolveRuntimeRem(
+                backlinkTargetId,
+                `portal:${portal._id}:backlink-target`,
+              );
+              if (!backlinkTarget) {
+                automaticViewComplete = false;
+                portalErrorIds.push(
+                  addError({
+                    severity: 'warning',
+                    scope: 'portal',
+                    operation: 'SearchPortal.AutomaticBacklinkSearchPortalFor.target-unresolved',
+                    rem_id: backlinkTargetId,
+                    portal_id: portal._id,
+                    message: 'Backlink target reference was captured but its Rem object could not be resolved.',
+                  }),
+                );
+              }
+            } else {
+              backlinkTargetResolution = 'ambiguous';
+              automaticViewComplete = false;
+              portalErrorIds.push(
+                addError({
+                  severity: 'warning',
+                  scope: 'portal',
+                  operation: 'SearchPortal.AutomaticBacklinkSearchPortalFor.ambiguous',
+                  portal_id: portal._id,
+                  message: `Non-empty backlink target rich text contained ${referenceIds.length} unique Rem references; exactly one is required.`,
+                }),
+              );
+            }
+          }
+        } catch (error) {
+          rethrowAbort(error);
+          backlinkTargetResolution = 'failed';
+          automaticViewComplete = false;
+          portalErrorIds.push(
+            addError({
+              severity: 'warning',
+              scope: 'portal',
+              operation: 'SearchPortal.AutomaticBacklinkSearchPortalFor',
+              portal_id: portal._id,
+              message: errorMessage(error),
+            }),
+          );
+        }
       }
 
       automaticView = {
-        kind: backlinkTarget ? 'backlink' : 'search',
+        kind: backlinkTargetId ? 'backlink' : 'search',
         complete: automaticViewComplete,
         result_ids: [...memberIds],
         result_order: 'sdk-return-order',
@@ -1536,7 +1644,9 @@ export async function buildSnapshot(
         root_result_complete: rootResultComplete,
         root_result_order: rootResultComplete ? 'visible-sibling-position' : null,
         root_result_blockers: rootResultBlockers,
-        backlink_target_id: backlinkTarget?._id ?? null,
+        backlink_target_rich_text: backlinkTargetRichText,
+        backlink_target_resolution: backlinkTargetResolution,
+        backlink_target_id: backlinkTargetId,
         query,
         filter,
         dont_include_nested_descendants: dontIncludeNested,
@@ -1595,6 +1705,11 @@ export async function buildSnapshot(
     portals[portal._id] = {
       portal_id: portal._id,
       portal_type: portalType,
+      portal_type_raw: portalTypeRaw,
+      portal_type_contract: {
+        source: 'public-host-implementation-and-sdk-enum',
+        resolved_undefined_means: 'portal',
+      },
       portal_type_name: portalTypeName(portalType),
       membership: {
         complete: membershipComplete,

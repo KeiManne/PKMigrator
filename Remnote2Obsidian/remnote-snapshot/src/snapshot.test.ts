@@ -16,6 +16,7 @@ interface MockOptions {
   childCalls?: string[];
   text?: RichTextInterface;
   portalType?: number;
+  portalTypeThrows?: boolean;
   members?: MockRem[];
   context?: MockRem[];
   contextThrows?: boolean;
@@ -27,6 +28,8 @@ interface MockOptions {
   position?: number;
   visiblePosition?: number;
   backlinkTarget?: MockRem;
+  backlinkRichText?: RichTextInterface | null;
+  backlinkRichTextThrows?: boolean;
   backlinks?: MockRem[];
   document?: boolean;
   folder?: boolean;
@@ -55,8 +58,9 @@ class MockRem implements SnapshotRem {
     this.text = options.text ?? [options.id];
   }
 
-  async getPortalType(): Promise<number> {
-    return this.options.portalType ?? PORTAL_TYPE.PORTAL;
+  async getPortalType(): Promise<number | undefined> {
+    if (this.options.portalTypeThrows) throw new Error('portal type unavailable');
+    return this.options.portalType;
   }
   async getChildrenRem(): Promise<MockRem[]> {
     this.options.childCalls?.push(this._id);
@@ -87,12 +91,17 @@ class MockRem implements SnapshotRem {
     }
     return (this.options.hidden ?? 'none') as HiddenState;
   }
-  async getPowerupPropertyAsRem(_powerup: string, slot: string): Promise<MockRem | undefined> {
-    this.options.slotCalls?.push(`rem:${slot}`);
-    return this.options.backlinkTarget;
-  }
   async getPowerupPropertyAsRichText(_powerup: string, slot: string): Promise<RichTextInterface> {
     this.options.slotCalls?.push(`rich:${slot}`);
+    if (slot === 'AutomaticBacklinkSearchPortalFor') {
+      if (this.options.backlinkRichTextThrows) throw new Error('backlink target unavailable');
+      if ('backlinkRichText' in this.options) {
+        return this.options.backlinkRichText as RichTextInterface;
+      }
+      return this.options.backlinkTarget
+        ? ([{ i: 'q', _id: this.options.backlinkTarget._id }] as RichTextInterface)
+        : [];
+    }
     return [`slot:${slot}`];
   }
   async remsReferencingThis(): Promise<MockRem[]> {
@@ -522,8 +531,96 @@ test('derives flat search roots from root state and visible sibling positions', 
     'rich:Query',
     'rich:Filter',
     'rich:DontIncludeNestedDescendants',
-    'rem:AutomaticBacklinkSearchPortalFor',
+    'rich:AutomaticBacklinkSearchPortalFor',
   ]);
+});
+
+test('distinguishes default ordinary portal type from a failed portal type read', async () => {
+  const ordinary = new MockRem({ id: 'ordinary', type: RemType.PORTAL });
+  const failed = new MockRem({ id: 'failed', type: RemType.PORTAL, portalTypeThrows: true });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [ordinary, failed] },
+  };
+
+  const snapshot = await buildSnapshot(plugin, () => undefined, { mode: 'complete' });
+  assert.equal(snapshot.portals.ordinary.portal_type, PORTAL_TYPE.PORTAL);
+  assert.equal(snapshot.portals.ordinary.portal_type_raw, 'undefined');
+  assert.equal(snapshot.portals.ordinary.portal_type_name, 'portal');
+  assert.equal(snapshot.portals.failed.portal_type, null);
+  assert.equal(snapshot.portals.failed.portal_type_raw, 'unknown');
+  assert.ok(snapshot.errors.some((error) => error.operation === 'Rem.getPortalType'));
+});
+
+test('parses backlink target references and preserves absent and ambiguous rich text states', async () => {
+  const target = new MockRem({ id: 'target' });
+  const single = new MockRem({
+    id: 'single',
+    type: RemType.PORTAL,
+    portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkTarget: target,
+  });
+  const absentUndefined = new MockRem({
+    id: 'absent-undefined', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkRichText: undefined as unknown as RichTextInterface,
+  });
+  const absentNull = new MockRem({
+    id: 'absent-null', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkRichText: null,
+  });
+  const absentEmpty = new MockRem({
+    id: 'absent-empty', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkRichText: [],
+  });
+  const ambiguous = new MockRem({
+    id: 'ambiguous', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkRichText: [{ i: 'q', _id: 'one' }, { i: 'q', _id: 'two' }] as RichTextInterface,
+  });
+  const malformed = new MockRem({
+    id: 'malformed', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkRichText: { i: 'q', _id: 'one' } as unknown as RichTextInterface,
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [single, absentUndefined, absentNull, absentEmpty, ambiguous, malformed, target] },
+  };
+
+  const snapshot = await buildSnapshot(plugin, () => undefined, { mode: 'complete' });
+  assert.equal(snapshot.portals.single.automatic_view?.backlink_target_id, 'target');
+  assert.equal(snapshot.portals.single.automatic_view?.backlink_target_resolution, 'single-reference');
+  for (const id of ['absent-undefined', 'absent-null', 'absent-empty']) {
+    assert.equal(snapshot.portals[id].automatic_view?.backlink_target_id, null);
+    assert.equal(snapshot.portals[id].automatic_view?.backlink_target_resolution, 'absent');
+  }
+  assert.equal(snapshot.portals.ambiguous.automatic_view?.backlink_target_resolution, 'ambiguous');
+  assert.equal(snapshot.portals.ambiguous.automatic_view?.complete, false);
+  assert.ok(snapshot.errors.some((error) =>
+    error.operation === 'SearchPortal.AutomaticBacklinkSearchPortalFor.ambiguous'));
+  assert.equal(snapshot.portals.malformed.automatic_view?.backlink_target_resolution, 'ambiguous');
+  assert.ok(snapshot.errors.some((error) =>
+    error.operation === 'SearchPortal.AutomaticBacklinkSearchPortalFor.runtime-value'));
+});
+
+test('distinguishes unavailable and failed backlink rich text reads', async () => {
+  const unavailable = new MockRem({
+    id: 'unavailable', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+  });
+  Object.assign(unavailable, { getPowerupPropertyAsRichText: undefined });
+  const failed = new MockRem({
+    id: 'failed', type: RemType.PORTAL, portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    backlinkRichTextThrows: true,
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [unavailable, failed] },
+  };
+
+  const snapshot = await buildSnapshot(plugin, () => undefined, { mode: 'complete' });
+  assert.equal(snapshot.portals.unavailable.automatic_view?.backlink_target_resolution, 'method-unavailable');
+  assert.equal(snapshot.portals.failed.automatic_view?.backlink_target_resolution, 'failed');
 });
 
 test('blocks derived search projection when root positions are duplicated', async () => {
