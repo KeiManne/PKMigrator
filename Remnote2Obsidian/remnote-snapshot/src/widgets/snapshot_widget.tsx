@@ -1,4 +1,4 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { renderWidget, usePlugin } from '@remnote/plugin-sdk';
 import { buildSnapshot, downloadSnapshot, type CaptureMode, type SnapshotPlugin } from '../snapshot';
 
@@ -46,6 +46,9 @@ function idArrayMap(value: unknown, field: string): Record<string, string[]> {
 
 function SnapshotWidget(): JSX.Element {
   const plugin = usePlugin();
+  useEffect(() => {
+    void plugin.app.toast('PKMigrator form loaded.').catch(() => undefined);
+  }, [plugin]);
   const [running, setRunning] = useState(false);
   const [mode, setMode] = useState<CaptureMode>('calibration');
   const [priorityPortals, setPriorityPortals] = useState('');
