@@ -14,10 +14,13 @@ npm run dev
 ```
 
 In RemNote, open **Settings → Plugins → Build → Develop from localhost**, enter
-`http://localhost:8080`, install the development plugin, and open the
-**PKMigrator Read-Only Snapshot** sidebar widget. Use a signed-in normal browser window or the
-RemNote desktop app that can reach localhost. If an embedded browser blocks localhost, switch to
-one of those supported RemNote clients; do not route the development server through a public host.
+`http://localhost:8080`, and install the development plugin. Open the Omnibar with
+**Ctrl/Cmd+K**, then run the exact command **Open PKMigrator snapshot**. This opens the exporter in
+a popup; it remains available as the **PKMigrator Read-Only Snapshot** right-sidebar widget too.
+The plugin does not open or read the knowledge base merely because it was activated. Use a
+signed-in normal browser window or the RemNote desktop app that can reach localhost. If an embedded
+browser blocks localhost, switch to one of those supported RemNote clients; do not route the
+development server through a public host.
 
 RemNote's official [quick-start guide](https://plugins.remnote.com/getting-started/quick_start_guide)
 documents **Develop from localhost** as the development-install route. `npm run build` also creates
