@@ -13,6 +13,7 @@ interface CaptureSettingsFile {
   systemDefinitionRecordIds?: unknown;
   detailRecordIds?: unknown;
   expectedHiddenByPortal?: unknown;
+  portalProbeSeedsByPortal?: unknown;
   maxContextProbes?: unknown;
   maxProbesPerPortal?: unknown;
   ordinaryOrderValidated?: unknown;
@@ -31,14 +32,14 @@ function stringArray(value: unknown, field: string): string[] {
   return value as string[];
 }
 
-function hiddenMap(value: unknown): Record<string, string[]> {
+function idArrayMap(value: unknown, field: string): Record<string, string[]> {
   if (value === null || Array.isArray(value) || typeof value !== 'object') {
-    throw new Error('expectedHiddenByPortal must be an object keyed by portal ID.');
+    throw new Error(`${field} must be an object keyed by portal ID.`);
   }
   return Object.fromEntries(
     Object.entries(value as Record<string, unknown>).map(([portalId, item]) => [
       portalId,
-      stringArray(item, `expectedHiddenByPortal.${portalId}`),
+      stringArray(item, `${field}.${portalId}`),
     ]),
   );
 }
@@ -52,6 +53,7 @@ function SnapshotWidget(): JSX.Element {
   const [systemDefinitionIds, setSystemDefinitionIds] = useState('');
   const [detailIds, setDetailIds] = useState('');
   const [expectedHiddenByPortal, setExpectedHiddenByPortal] = useState('{}');
+  const [portalProbeSeedsByPortal, setPortalProbeSeedsByPortal] = useState('{}');
   const [maxContextProbes, setMaxContextProbes] = useState(10_000);
   const [maxProbesPerPortal, setMaxProbesPerPortal] = useState(10_000);
   const [ordinaryOrderValidated, setOrdinaryOrderValidated] = useState(false);
@@ -94,13 +96,21 @@ function SnapshotWidget(): JSX.Element {
       const details = stringArray(parsed.detailRecordIds, 'detailRecordIds');
       let hiddenByPortal: Record<string, string[]> = {};
       if (parsed.expectedHiddenByPortal !== undefined) {
-        hiddenByPortal = hiddenMap(parsed.expectedHiddenByPortal);
+        hiddenByPortal = idArrayMap(parsed.expectedHiddenByPortal, 'expectedHiddenByPortal');
+      }
+      let probeSeedsByPortal: Record<string, string[]> = {};
+      if (parsed.portalProbeSeedsByPortal !== undefined) {
+        probeSeedsByPortal = idArrayMap(
+          parsed.portalProbeSeedsByPortal,
+          'portalProbeSeedsByPortal',
+        );
       }
       setPriorityPortals(portalIds.join('\n'));
       setClassificationIds(candidates.join('\n'));
       setSystemDefinitionIds(systemDefinitions.join('\n'));
       setDetailIds(details.join('\n'));
       setExpectedHiddenByPortal(JSON.stringify(hiddenByPortal, null, 2));
+      setPortalProbeSeedsByPortal(JSON.stringify(probeSeedsByPortal, null, 2));
       if (parsed.maxContextProbes !== undefined) {
         if (!Number.isSafeInteger(parsed.maxContextProbes) || Number(parsed.maxContextProbes) <= 0) throw new Error('maxContextProbes must be a positive safe integer.');
         setMaxContextProbes(Number(parsed.maxContextProbes));
@@ -142,7 +152,14 @@ function SnapshotWidget(): JSX.Element {
         classificationRecordIds: ids(classificationIds),
         systemDefinitionRecordIds: ids(systemDefinitionIds),
         detailRecordIds: ids(detailIds),
-        expectedHiddenByPortal: hiddenMap(JSON.parse(expectedHiddenByPortal) as unknown),
+        expectedHiddenByPortal: idArrayMap(
+          JSON.parse(expectedHiddenByPortal) as unknown,
+          'expectedHiddenByPortal',
+        ),
+        portalProbeSeedsByPortal: idArrayMap(
+          JSON.parse(portalProbeSeedsByPortal) as unknown,
+          'portalProbeSeedsByPortal',
+        ),
         maxContextProbes,
         maxProbesPerPortal,
         ordinaryOrderValidated,
@@ -182,6 +199,7 @@ function SnapshotWidget(): JSX.Element {
       {checkbox(richTextFingerprintCalibrated, setRichTextFingerprintCalibrated, 'I compared canonical SDK rich-text fingerprints with the matching raw export records.')}
       {checkbox(childOrderCalibrated, setChildOrderCalibrated, 'I compared SDK child array order with raw fractional-f sibling order.')}
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Known hidden IDs by portal, as JSON (optional)</span><textarea value={expectedHiddenByPortal} disabled={running} onChange={(event) => setExpectedHiddenByPortal(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>
+      <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Raw probe candidate IDs by portal, as JSON (optional)</span><textarea value={portalProbeSeedsByPortal} disabled={running} onChange={(event) => setPortalProbeSeedsByPortal(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Document/folder candidate IDs</span><textarea value={classificationIds} disabled={running} onChange={(event) => setClassificationIds(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>System-definition candidate IDs</span><textarea value={systemDefinitionIds} disabled={running} onChange={(event) => setSystemDefinitionIds(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Extra rich-record IDs</span><textarea value={detailIds} disabled={running} onChange={(event) => setDetailIds(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>

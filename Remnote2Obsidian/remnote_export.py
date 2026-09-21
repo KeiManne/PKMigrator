@@ -728,7 +728,10 @@ class Converter:
                 if kind == "q" and part.get("_id"):
                     target_id = str(part["_id"])
                     target = self.index.get(target_id)
-                    if not target or target_id in seen_references:
+                    if not target:
+                        fallback = self._plain_rich(part.get("textOfDeletedRem"), seen_references).strip()
+                        result.append(f"{fallback} (({target_id}))" if fallback else f"(({target_id}))")
+                    elif target_id in seen_references:
                         result.append(f"(({target_id}))")
                     else:
                         result.append(self._plain_rich(target.get("key"), seen_references | {target_id}))
@@ -767,7 +770,8 @@ class Converter:
             text = str(part.get("text", ""))
             if kind == "q" and part.get("_id"):
                 target_id = str(part["_id"])
-                label = self.plain_rich(self.index.get(target_id, {}).get("key")) or target_id
+                fallback_label = self._plain_rich(part.get("textOfDeletedRem"), set()).strip()
+                label = self.plain_rich(self.index.get(target_id, {}).get("key")) or fallback_label or target_id
                 target = self.canonical.get(target_id)
                 if target:
                     self._referenced_canonical.add(target_id)
@@ -787,8 +791,16 @@ class Converter:
                         details={"target_id": target_id},
                     )
                 else:
-                    rendered.append(_escape_markdown(f"(({target_id}))"))
-                    self.issue("unresolved_reference", "warning", "Reference has no canonical pilot location", rem_id=owner_id, path=ctx.appearance_path, details={"target_id": target_id})
+                    unresolved = f"{fallback_label} (({target_id}))" if fallback_label else f"(({target_id}))"
+                    rendered.append(_escape_markdown(unresolved))
+                    self.issue(
+                        "unresolved_reference",
+                        "warning",
+                        "Reference target has no canonical output location; any exported deleted-reference label was retained with the unresolved ID",
+                        rem_id=owner_id,
+                        path=ctx.appearance_path,
+                        details={"target_id": target_id, "fallback_label_preserved": bool(fallback_label)},
+                    )
                 continue
             if kind == "i":
                 source = part.get("url")
@@ -1144,9 +1156,15 @@ class Converter:
                         reason="Record lies outside every evidenced native Markdown document boundary; native-export absence alone is not proof that it is system metadata.",
                     )
             elif self._has_portal_ancestor(rem_id):
+                content_bearing = bool(raw.get("key")) or bool(raw.get("value"))
                 entry.update(
-                    disposition="excluded_portal_implementation_record",
-                    reason="Record is portal/query implementation data rather than a rendered source member.",
+                    disposition="unresolved_portal_descendant",
+                    reason=(
+                        "Content-bearing record is owned below a portal but was not rendered; portal ancestry is not proof that it is implementation metadata."
+                        if content_bearing
+                        else "Empty portal-owned wrapper was not rendered and needs positive structural evidence before exclusion."
+                    ),
+                    content_bearing=content_bearing,
                 )
             else:
                 entry.update(
@@ -1171,6 +1189,23 @@ class Converter:
                 "error",
                 "Exported records outside native Markdown boundaries need explicit source/system classification",
                 details={"record_count": outside_count},
+            )
+        portal_descendants = [
+            item
+            for item in ledger.values()
+            if item["disposition"] == "unresolved_portal_descendant"
+        ]
+        if portal_descendants:
+            content_count = sum(item["content_bearing"] for item in portal_descendants)
+            self.issue(
+                "unresolved_portal_descendants",
+                "error",
+                "Portal-owned records without rendered occurrences need supported membership/context evidence; none were assumed to be disposable implementation metadata",
+                details={
+                    "record_count": len(portal_descendants),
+                    "content_bearing_count": content_count,
+                    "empty_wrapper_count": len(portal_descendants) - content_count,
+                },
             )
         return ledger
 

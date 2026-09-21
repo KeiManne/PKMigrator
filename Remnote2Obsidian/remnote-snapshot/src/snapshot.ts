@@ -31,6 +31,7 @@ export interface CaptureOptions {
   searchOrderValidated?: boolean;
   visibilitySemanticsValidated?: boolean;
   expectedHiddenByPortal?: Record<string, string[]>;
+  portalProbeSeedsByPortal?: Record<string, string[]>;
   richTextFingerprintCalibrated?: boolean;
   childOrderCalibrated?: boolean;
 }
@@ -76,6 +77,7 @@ export interface SnapshotPlugin {
   };
   rem: {
     getAll(): Promise<SnapshotRem[]>;
+    findOne?(id: string): Promise<SnapshotRem | undefined>;
   };
 }
 
@@ -104,6 +106,20 @@ export interface SourceRecord {
   detail_level: 'inventory' | 'rich';
   rich_text_fingerprint: string;
   export_comparable_rich_text_fingerprint: string;
+}
+
+export interface RuntimeReturnedRecord {
+  id: string;
+  type: number;
+  parent_id: string | null;
+  child_ids: string[];
+  text: RichTextInterface | null;
+  back_text: RichTextInterface | null;
+  created_at: number;
+  updated_at: number;
+  local_updated_at: number;
+  bulk_present: boolean;
+  first_seen_via: string[];
 }
 
 export interface PortalRecord {
@@ -136,6 +152,13 @@ export interface PortalRecord {
     expected_hidden_ids: string[];
     expected_hidden_matches: string[];
     expected_hidden_mismatches: string[];
+    probe_seeds: {
+      requested_ids: string[];
+      resolved_ids: string[];
+      missing_ids: string[];
+      supplemental_ids: string[];
+      establishes_complete_scope: false;
+    };
   };
   collapsed: {
     complete: boolean;
@@ -155,10 +178,21 @@ export interface PortalRecord {
     complete: boolean;
     result_ids: string[];
     result_order: 'sdk-return-order';
+    result_interpretation:
+      | 'direct-members'
+      | 'direct-members-unmapped-nested-contexts'
+      | 'direct-members-context-discovery-incomplete';
     backlink_target_id: string | null;
     query: RichTextInterface | null;
     filter: RichTextInterface | null;
     dont_include_nested_descendants: RichTextInterface | null;
+    limitation: string;
+  };
+  nested_contexts: {
+    status: 'none-detected' | 'detected-unresolved' | 'discovery-incomplete';
+    detected_ids: string[];
+    evidence: Record<string, Array<'direct-members' | 'context-array' | 'bulk-child'>>;
+    projection_safe: boolean;
     limitation: string;
   };
   migration: {
@@ -233,6 +267,7 @@ export interface MigrationSnapshot {
     };
   };
   records: Record<string, SourceRecord>;
+  runtime_returned_records: Record<string, RuntimeReturnedRecord>;
   portals: Record<string, PortalRecord>;
   relations: {
     backlinks: Record<
@@ -293,6 +328,7 @@ const API_METHODS = [
   'App.waitForInitialSync',
   'KnowledgeBase.getCurrentKnowledgeBaseData',
   'RemNamespace.getAll',
+  'RemNamespace.findOne',
   'Rem.getPortalType',
   'Rem.getPortalDirectlyIncludedRem',
   'Rem.allRemInDocumentOrPortal',
@@ -481,6 +517,55 @@ export async function buildSnapshot(
     });
   }
   const remById = new Map(allRem.map((rem) => [rem._id, rem]));
+  const runtimeRemById = new Map<string, SnapshotRem>();
+  const runtimeReturnedRecords: Record<string, RuntimeReturnedRecord> = {};
+  const rememberRuntimeRem = (rem: SnapshotRem, via: string): void => {
+    runtimeRemById.set(rem._id, rem);
+    const existing = runtimeReturnedRecords[rem._id];
+    if (existing) {
+      if (!existing.first_seen_via.includes(via)) existing.first_seen_via.push(via);
+      return;
+    }
+    runtimeReturnedRecords[rem._id] = {
+      id: rem._id,
+      type: rem.type,
+      parent_id: rem.parent,
+      child_ids: [...(rem.children ?? [])],
+      text: cloneRichText(rem.text),
+      back_text: cloneRichText(rem.backText),
+      created_at: rem.createdAt,
+      updated_at: rem.updatedAt,
+      local_updated_at: rem.localUpdatedAt,
+      bulk_present: remById.has(rem._id),
+      first_seen_via: [via],
+    };
+  };
+  const resolveRuntimeRem = async (id: string, via: string): Promise<SnapshotRem | undefined> => {
+    const runtimeRem = runtimeRemById.get(id);
+    if (runtimeRem) {
+      rememberRuntimeRem(runtimeRem, via);
+      return runtimeRem;
+    }
+    const bulkRem = remById.get(id);
+    if (bulkRem) return bulkRem;
+    if (!plugin.rem.findOne) return undefined;
+    try {
+      const found = await plugin.rem.findOne(id);
+      throwIfAborted(options.signal);
+      if (found) rememberRuntimeRem(found, via);
+      return found;
+    } catch (error) {
+      rethrowAbort(error);
+      addError({
+        severity: 'warning',
+        scope: 'record',
+        operation: 'RemNamespace.findOne',
+        rem_id: id,
+        message: `${via}: ${errorMessage(error)}`,
+      });
+      return undefined;
+    }
+  };
 
   onProgress(`Indexing ${allRem.length} source records from the bulk response…`);
   const recordEntries = allRem.map((rem): [string, SourceRecord] => {
@@ -626,17 +711,27 @@ export async function buildSnapshot(
     visibility_overrides: {},
   };
   const priorityPortalIds = new Set(options.priorityPortalIds ?? []);
-  const allPortalRems = allRem.filter((rem) => rem.type === REM_TYPE_PORTAL);
-  const missingRequestedPortalIds = [...priorityPortalIds]
-    .filter((id) => remById.get(id)?.type !== REM_TYPE_PORTAL)
-    .sort();
+  const resolvedPriorityPortalRems: SnapshotRem[] = [];
+  const missingRequestedPortalIds: string[] = [];
+  for (const id of [...priorityPortalIds].sort()) {
+    const rem = await resolveRuntimeRem(id, 'explicit-portal-lookup');
+    if (rem?.type === REM_TYPE_PORTAL) resolvedPriorityPortalRems.push(rem);
+    else missingRequestedPortalIds.push(id);
+  }
+  const allPortalRems = [
+    ...new Map(
+      [...allRem.filter((rem) => rem.type === REM_TYPE_PORTAL), ...resolvedPriorityPortalRems].map(
+        (rem) => [rem._id, rem],
+      ),
+    ).values(),
+  ];
   for (const id of missingRequestedPortalIds) {
     addError({
       severity: 'error',
       scope: 'portal',
       operation: 'resolve-calibration-portal',
       portal_id: id,
-      message: 'Requested calibration ID was not returned as a portal by RemNamespace.getAll.',
+      message: 'Requested calibration ID was not resolved as a portal by getAll() or findOne().',
     });
   }
   if (mode === 'calibration' && priorityPortalIds.size === 0) {
@@ -666,6 +761,13 @@ export async function buildSnapshot(
     ...classificationIds,
     ...systemDefinitionIds,
   ]);
+  const bulkPortalChildrenByParent = new Map<string, SnapshotRem[]>();
+  for (const rem of allRem) {
+    if (rem.type !== REM_TYPE_PORTAL || rem.parent === null) continue;
+    const children = bulkPortalChildrenByParent.get(rem.parent) ?? [];
+    children.push(rem);
+    bulkPortalChildrenByParent.set(rem.parent, children);
+  }
   let kbIdAtEnd: string | null = kbId;
   let kbConsistent = kbId !== null;
   let knowledgeBaseChanged = false;
@@ -734,8 +836,11 @@ export async function buildSnapshot(
 
     let membershipComplete = true;
     let memberIds: string[] = [];
+    let memberRems: SnapshotRem[] = [];
     try {
-      memberIds = (await portal.getPortalDirectlyIncludedRem()).map((rem) => rem._id);
+      memberRems = await portal.getPortalDirectlyIncludedRem();
+      for (const rem of memberRems) rememberRuntimeRem(rem, `portal:${portal._id}:direct-members`);
+      memberIds = memberRems.map((rem) => rem._id);
       throwIfAborted(options.signal);
     } catch (error) {
       rethrowAbort(error);
@@ -753,8 +858,11 @@ export async function buildSnapshot(
 
     let contextComplete = true;
     let contextIds: string[] = [];
+    let contextRems: SnapshotRem[] = [];
     try {
-      contextIds = (await portal.allRemInDocumentOrPortal()).map((rem) => rem._id);
+      contextRems = await portal.allRemInDocumentOrPortal();
+      for (const rem of contextRems) rememberRuntimeRem(rem, `portal:${portal._id}:context-array`);
+      contextIds = contextRems.map((rem) => rem._id);
       throwIfAborted(options.signal);
     } catch (error) {
       rethrowAbort(error);
@@ -770,7 +878,61 @@ export async function buildSnapshot(
       );
     }
 
-    const allCandidateIds = descendantCandidates(memberIds, records);
+    const nestedContextEvidence: PortalRecord['nested_contexts']['evidence'] = {};
+    const noteNestedContext = (
+      rem: SnapshotRem,
+      source: 'direct-members' | 'context-array' | 'bulk-child',
+    ): void => {
+      if (rem._id === portal._id || rem.type !== REM_TYPE_PORTAL) return;
+      const sources = nestedContextEvidence[rem._id] ?? [];
+      if (!sources.includes(source)) sources.push(source);
+      nestedContextEvidence[rem._id] = sources;
+    };
+    for (const rem of memberRems) noteNestedContext(rem, 'direct-members');
+    for (const rem of contextRems) noteNestedContext(rem, 'context-array');
+    for (const rem of bulkPortalChildrenByParent.get(portal._id) ?? []) {
+      noteNestedContext(rem, 'bulk-child');
+    }
+    const nestedContextIds = Object.keys(nestedContextEvidence).sort();
+    const searchContextDiscoveryIncomplete =
+      portalType === PORTAL_TYPE.SEARCH_PORTAL && !contextComplete;
+    const nestedContextUnresolved =
+      portalType === PORTAL_TYPE.SEARCH_PORTAL && nestedContextIds.length > 0;
+    if (nestedContextUnresolved) {
+      portalErrorIds.push(
+        addError({
+          severity: 'error',
+          scope: 'portal',
+          operation: 'nested-search-context-unresolved',
+          portal_id: portal._id,
+          message: `Detected ${nestedContextIds.length} nested portal context(s); outer membership and visibility remain diagnostic until live source-result mapping is calibrated.`,
+        }),
+      );
+    }
+    if (searchContextDiscoveryIncomplete) {
+      portalErrorIds.push(
+        addError({
+          severity: 'error',
+          scope: 'portal',
+          operation: 'search-context-discovery-incomplete',
+          portal_id: portal._id,
+          message:
+            'Search portal context discovery failed; absence of nested result contexts cannot be established, so flat membership and visibility projections are suppressed.',
+        }),
+      );
+    }
+
+    const probeSeedIds = [...new Set(options.portalProbeSeedsByPortal?.[portal._id] ?? [])].sort();
+    const discoveredCandidateIds = [
+      ...new Set([...descendantCandidates(memberIds, records), ...contextIds]),
+    ].filter((id) => id !== portal._id);
+    const discoveredCandidateSet = new Set(discoveredCandidateIds);
+    const supplementalProbeSeedIds = probeSeedIds.filter(
+      (id) => !discoveredCandidateSet.has(id),
+    );
+    const allCandidateIds = [
+      ...new Set([...probeSeedIds, ...discoveredCandidateIds]),
+    ].filter((id) => id !== portal._id);
     const probeCount = Math.min(
       allCandidateIds.length,
       maxProbesPerPortal,
@@ -795,32 +957,31 @@ export async function buildSnapshot(
         }),
       );
     }
-    const hiddenMethodAvailable =
-      candidateIds.length === 0 ||
-      typeof remById.get(candidateIds[0])?.getHiddenExplicitlyIncludedState === 'function';
-    if (!hiddenMethodAvailable) {
+    if (supplementalProbeSeedIds.length) {
       visibilityComplete = false;
       portalErrorIds.push(
         addError({
           severity: 'warning',
           scope: 'portal',
-          operation: 'Rem.getHiddenExplicitlyIncludedState',
+          operation: 'raw-probe-seed-outside-sdk-context',
           portal_id: portal._id,
-          message:
-            'The method exists in @remnote/plugin-sdk 0.0.46 types but is unavailable in this RemNote host.',
+          message: `${supplementalProbeSeedIds.length} raw probe seed(s) were absent from SDK direct-member/portal-context discovery; captured values remain diagnostic and visibility scope is incomplete.`,
         }),
       );
     }
-
     const probeCandidate = async (candidateId: string) => {
       throwIfAborted(options.signal);
-      const candidate = remById.get(candidateId);
+      const candidate = await resolveRuntimeRem(
+        candidateId,
+        `portal:${portal._id}:visibility-probe`,
+      );
       if (!candidate) {
         return {
           candidateId,
           hidden: undefined,
           hiddenFailed: false,
           hiddenInvalid: false,
+          hiddenMethodUnavailable: false,
           collapsed: undefined,
           position: undefined,
           visiblePosition: undefined,
@@ -833,8 +994,10 @@ export async function buildSnapshot(
       let visiblePosition: number | undefined;
       let hiddenFailed = false;
       let hiddenInvalid = false;
+      const hiddenMethodUnavailable =
+        typeof candidate.getHiddenExplicitlyIncludedState !== 'function';
       try {
-        const rawHidden: unknown = hiddenMethodAvailable
+        const rawHidden: unknown = !hiddenMethodUnavailable
           ? await candidate.getHiddenExplicitlyIncludedState?.(portal._id)
           : undefined;
         if (
@@ -911,6 +1074,7 @@ export async function buildSnapshot(
         hidden,
         hiddenFailed,
         hiddenInvalid,
+        hiddenMethodUnavailable,
         collapsed,
         position,
         visiblePosition,
@@ -947,7 +1111,7 @@ export async function buildSnapshot(
             operation: 'resolve-portal-candidate',
             rem_id: result.candidateId,
             portal_id: portal._id,
-            message: 'Portal member or descendant was not returned by RemNamespace.getAll.',
+            message: 'Portal probe candidate was not resolved by getAll(), a live method response, or findOne().',
           }),
         );
         continue;
@@ -955,7 +1119,19 @@ export async function buildSnapshot(
       if (result.hidden === undefined) {
         visibilityComplete = false;
         visibilityStates[result.candidateId] = 'unknown';
-        if (!result.hiddenFailed && !result.hiddenInvalid && hiddenMethodAvailable) {
+        if (result.hiddenMethodUnavailable) {
+          portalErrorIds.push(
+            addError({
+              severity: 'warning',
+              scope: 'portal',
+              operation: 'Rem.getHiddenExplicitlyIncludedState.unavailable',
+              rem_id: result.candidateId,
+              portal_id: portal._id,
+              message:
+                'The method exists in @remnote/plugin-sdk 0.0.46 types but is unavailable on this runtime Rem object.',
+            }),
+          );
+        } else if (!result.hiddenFailed && !result.hiddenInvalid) {
           portalErrorIds.push(
             addError({
               severity: 'warning',
@@ -981,6 +1157,8 @@ export async function buildSnapshot(
       };
     }
 
+    if (nestedContextUnresolved || searchContextDiscoveryIncomplete) visibilityComplete = false;
+
     const orderValidated =
       portalType === PORTAL_TYPE.PORTAL
         ? options.ordinaryOrderValidated === true
@@ -1005,7 +1183,9 @@ export async function buildSnapshot(
         }),
       );
     }
-    const runtimeValuesValid = candidateResults.every((result) => !result.hiddenInvalid);
+    const runtimeValuesValid = candidateResults.every(
+      (result) => !result.hiddenInvalid && !result.hiddenMethodUnavailable,
+    );
     const visibilitySemanticsValidated = options.visibilitySemanticsValidated === true;
     const portalMigrationComplete =
       membershipComplete &&
@@ -1021,7 +1201,8 @@ export async function buildSnapshot(
       let query: RichTextInterface | null = null;
       let filter: RichTextInterface | null = null;
       let dontIncludeNested: RichTextInterface | null = null;
-      let automaticViewComplete = membershipComplete;
+      let automaticViewComplete =
+        membershipComplete && !nestedContextUnresolved && !searchContextDiscoveryIncomplete;
       for (const [operation, slot, setter] of [
         ['SearchPortal.Query', 'q', (value: RichTextInterface) => (query = cloneRichText(value))],
         ['SearchPortal.Filter', 'f', (value: RichTextInterface) => (filter = cloneRichText(value))],
@@ -1050,6 +1231,9 @@ export async function buildSnapshot(
       }
       try {
         backlinkTarget = await portal.getPowerupPropertyAsRem('sp', 'b');
+        if (backlinkTarget) {
+          rememberRuntimeRem(backlinkTarget, `portal:${portal._id}:backlink-target`);
+        }
         throwIfAborted(options.signal);
       } catch (error) {
         rethrowAbort(error);
@@ -1070,6 +1254,11 @@ export async function buildSnapshot(
         complete: automaticViewComplete,
         result_ids: [...memberIds],
         result_order: 'sdk-return-order',
+        result_interpretation: nestedContextUnresolved
+          ? 'direct-members-unmapped-nested-contexts'
+          : searchContextDiscoveryIncomplete
+            ? 'direct-members-context-discovery-incomplete'
+            : 'direct-members',
         backlink_target_id: backlinkTarget?._id ?? null,
         query,
         filter,
@@ -1080,11 +1269,15 @@ export async function buildSnapshot(
 
       if (backlinkTarget && !(backlinkTarget._id in backlinkRelations)) {
         try {
+          const referencingRems = await backlinkTarget.remsReferencingThis();
+          for (const rem of referencingRems) {
+            rememberRuntimeRem(rem, `portal:${portal._id}:backlink-relation`);
+          }
           backlinkRelations[backlinkTarget._id] = {
             complete: true,
             ordered: false,
             method: 'Rem.remsReferencingThis',
-            member_ids: (await backlinkTarget.remsReferencingThis()).map((rem) => rem._id).sort(),
+            member_ids: referencingRems.map((rem) => rem._id).sort(),
           };
         } catch (error) {
           rethrowAbort(error);
@@ -1107,6 +1300,16 @@ export async function buildSnapshot(
         }
       }
     }
+
+    const candidateResultById = new Map(
+      candidateResults.map((result) => [result.candidateId, result]),
+    );
+    const resolvedProbeSeedIds = probeSeedIds.filter(
+      (id) => candidateResultById.has(id) && !candidateResultById.get(id)?.missing,
+    );
+    const missingProbeSeedIds = probeSeedIds.filter(
+      (id) => !candidateResultById.has(id) || candidateResultById.get(id)?.missing,
+    );
 
     portals[portal._id] = {
       portal_id: portal._id,
@@ -1140,6 +1343,13 @@ export async function buildSnapshot(
         expected_hidden_ids: expectedHiddenIds,
         expected_hidden_matches: expectedHiddenMatches,
         expected_hidden_mismatches: expectedHiddenMismatches,
+        probe_seeds: {
+          requested_ids: probeSeedIds,
+          resolved_ids: resolvedProbeSeedIds,
+          missing_ids: missingProbeSeedIds,
+          supplemental_ids: supplementalProbeSeedIds,
+          establishes_complete_scope: false,
+        },
       },
       collapsed: {
         complete: collapsedComplete,
@@ -1152,6 +1362,21 @@ export async function buildSnapshot(
         states: positionStates,
       },
       automatic_view: automaticView,
+      nested_contexts: {
+        status: nestedContextUnresolved
+          ? 'detected-unresolved'
+          : searchContextDiscoveryIncomplete
+            ? 'discovery-incomplete'
+            : 'none-detected',
+        detected_ids: nestedContextIds,
+        evidence: nestedContextEvidence,
+        projection_safe: !nestedContextUnresolved && !searchContextDiscoveryIncomplete,
+        limitation: nestedContextUnresolved
+          ? 'Direct-member IDs are not assumed to be rendered source-result IDs. Nested context membership and portal-local visibility must be calibrated independently.'
+          : searchContextDiscoveryIncomplete
+            ? 'Context discovery failed, so the capture cannot establish whether nested result-context portals exist. Direct members remain diagnostic only.'
+          : 'No nested portal context was detected in direct members, the context array, or bulk portal children; absence is capture evidence, not an SDK guarantee.',
+      },
       migration: {
         membership_complete: membershipComplete,
         order_validated: orderValidated,
@@ -1174,6 +1399,8 @@ export async function buildSnapshot(
     if (
       membershipComplete &&
       orderValidated &&
+      !nestedContextUnresolved &&
+      !searchContextDiscoveryIncomplete &&
       (portalType === PORTAL_TYPE.PORTAL || portalType === PORTAL_TYPE.SEARCH_PORTAL)
     ) {
       converterProjection.portal_snapshots[portal._id] = {
@@ -1310,6 +1537,7 @@ export async function buildSnapshot(
       },
     },
     records,
+    runtime_returned_records: runtimeReturnedRecords,
     portals,
     relations: { backlinks: backlinkRelations, tags: tagRelations },
     classifications: {
@@ -1338,6 +1566,7 @@ export async function buildSnapshot(
   snapshot.capture.payload_sha256 = await sha256Hex(
     JSON.stringify({
       records: snapshot.records,
+      runtime_returned_records: snapshot.runtime_returned_records,
       portals: snapshot.portals,
       relations: snapshot.relations,
       classifications: snapshot.classifications,

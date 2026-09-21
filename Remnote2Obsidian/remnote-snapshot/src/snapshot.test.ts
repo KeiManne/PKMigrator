@@ -15,6 +15,7 @@ interface MockOptions {
   portalType?: number;
   members?: MockRem[];
   context?: MockRem[];
+  contextThrows?: boolean;
   hidden?: HiddenState | string;
   collapsed?: boolean;
   collapseThrows?: boolean;
@@ -56,6 +57,7 @@ class MockRem implements SnapshotRem {
     return this.options.members ?? [];
   }
   async allRemInDocumentOrPortal(): Promise<MockRem[]> {
+    if (this.options.contextThrows) throw new Error('context unavailable');
     return this.options.context ?? this.options.members ?? [];
   }
   async isCollapsed(): Promise<boolean> {
@@ -322,4 +324,137 @@ test('classifies only requested system-definition candidates with positive predi
   assert.deepEqual(Object.keys(snapshot.classifications.system_definition.states), ['system']);
   assert.equal(snapshot.classifications.system_definition.states.system.is_powerup, true);
   assert.equal(snapshot.classifications.system_definition.states.ordinary, undefined);
+});
+
+test('nested search contexts fail closed and preserve runtime Rems absent from bulk inventory', async () => {
+  const bulkSource = new MockRem({ id: 'source', hidden: 'none' });
+  const runtimeSource = new MockRem({ id: 'source', hidden: 'hidden' });
+  const virtualContext = new MockRem({
+    id: 'virtual-context',
+    type: RemType.PORTAL,
+    parent: 'search',
+    members: [runtimeSource],
+  });
+  const search = new MockRem({
+    id: 'search',
+    type: RemType.PORTAL,
+    portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    members: [runtimeSource],
+    context: [runtimeSource, virtualContext],
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [search, bulkSource] },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'calibration',
+    priorityPortalIds: ['search'],
+    searchOrderValidated: true,
+    visibilitySemanticsValidated: true,
+  });
+  assert.equal(snapshot.portals.search.nested_contexts.status, 'detected-unresolved');
+  assert.deepEqual(snapshot.portals.search.nested_contexts.detected_ids, ['virtual-context']);
+  assert.equal(snapshot.portals.search.visibility.complete, false);
+  assert.equal(snapshot.portals.search.migration.complete, false);
+  assert.equal(snapshot.converter_projection.portal_snapshots.search, undefined);
+  assert.equal(snapshot.converter_projection.visibility_overrides.search, undefined);
+  assert.equal(snapshot.portals.search.automatic_view?.result_interpretation, 'direct-members-unmapped-nested-contexts');
+  assert.equal(snapshot.runtime_returned_records['virtual-context'].bulk_present, false);
+  assert.equal(snapshot.portals.search.visibility.states.source, 'hidden');
+  assert.ok(snapshot.runtime_returned_records['virtual-context'].first_seen_via.some((value) => value.endsWith(':context-array')));
+});
+
+test('failed search context discovery suppresses otherwise validated flat projections', async () => {
+  const result = new MockRem({
+    id: 'result',
+    hidden: 'included',
+    position: 0,
+    visiblePosition: 0,
+  });
+  const search = new MockRem({
+    id: 'search',
+    type: RemType.PORTAL,
+    portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    members: [result],
+    contextThrows: true,
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [search, result] },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'calibration',
+    priorityPortalIds: ['search'],
+    searchOrderValidated: true,
+    visibilitySemanticsValidated: true,
+  });
+
+  assert.equal(snapshot.portals.search.membership.complete, true);
+  assert.equal(snapshot.portals.search.context.complete, false);
+  assert.equal(snapshot.portals.search.nested_contexts.status, 'discovery-incomplete');
+  assert.equal(snapshot.portals.search.nested_contexts.projection_safe, false);
+  assert.equal(snapshot.portals.search.visibility.complete, false);
+  assert.equal(snapshot.portals.search.migration.complete, false);
+  assert.equal(snapshot.portals.search.automatic_view?.complete, false);
+  assert.equal(
+    snapshot.portals.search.automatic_view?.result_interpretation,
+    'direct-members-context-discovery-incomplete',
+  );
+  assert.equal(snapshot.converter_projection.portal_snapshots.search, undefined);
+  assert.equal(snapshot.converter_projection.visibility_overrides.search, undefined);
+  assert.ok(
+    snapshot.errors.some((error) => error.operation === 'search-context-discovery-incomplete'),
+  );
+});
+
+test('per-portal raw probe seeds are diagnostic, prioritized, and may resolve through findOne', async () => {
+  const seed = new MockRem({ id: 'raw-hidden-root', hidden: 'hidden' });
+  const portal = new MockRem({ id: 'portal', type: RemType.PORTAL, members: [] });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: {
+      getAll: async () => [portal],
+      findOne: async (id) => (id === seed._id ? seed : undefined),
+    },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'calibration',
+    priorityPortalIds: ['portal'],
+    maxContextProbes: 1,
+    maxProbesPerPortal: 1,
+    portalProbeSeedsByPortal: { portal: [seed._id] },
+  });
+  assert.deepEqual(snapshot.portals.portal.visibility.probe_seeds, {
+    requested_ids: ['raw-hidden-root'],
+    resolved_ids: ['raw-hidden-root'],
+    missing_ids: [],
+    supplemental_ids: ['raw-hidden-root'],
+    establishes_complete_scope: false,
+  });
+  assert.equal(snapshot.portals.portal.visibility.states['raw-hidden-root'], 'hidden');
+  assert.equal(snapshot.portals.portal.visibility.complete, false);
+  assert.equal(snapshot.runtime_returned_records['raw-hidden-root'].bulk_present, false);
+});
+
+test('a rejected findOne lookup is recorded without aborting the capture', async () => {
+  const portal = new MockRem({ id: 'portal', type: RemType.PORTAL, members: [] });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: {
+      getAll: async () => [portal],
+      findOne: async () => { throw new Error('lookup rejected'); },
+    },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'calibration',
+    priorityPortalIds: ['portal'],
+    portalProbeSeedsByPortal: { portal: ['missing-seed'] },
+  });
+  assert.deepEqual(snapshot.portals.portal.visibility.probe_seeds.missing_ids, ['missing-seed']);
+  assert.ok(snapshot.errors.some((error) => error.operation === 'RemNamespace.findOne'));
+  assert.ok(snapshot.errors.some((error) => error.operation === 'resolve-portal-candidate'));
 });

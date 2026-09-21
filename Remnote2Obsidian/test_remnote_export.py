@@ -372,11 +372,12 @@ class ConverterTests(unittest.TestCase):
             self.assertEqual(manifest["source_map"]["child-doc"]["plain_original_text"], child_title)
             self.assertEqual(manifest["record_ledger"]["child-doc"]["disposition"], "included_document")
 
-    def test_full_ledger_accounts_for_unresolved_view_and_query_helper(self):
+    def test_full_ledger_keeps_portal_descendant_content_and_empty_wrappers_unresolved(self):
         docs = [
             rem("root", "Root"),
             rem("search", "", "root", "a0", type=6, portalType=4, searchResults=["missing"]),
             rem("helper", "query:", "search", "a0"),
+            rem("empty-wrapper", [], "search", "a1"),
         ]
         payload = {"knowledgebaseId": "synthetic-kb", "docs": docs}
         converter = Converter(
@@ -392,8 +393,39 @@ class ConverterTests(unittest.TestCase):
         self.assertEqual(manifest["status"], "incomplete_full_migration")
         self.assertEqual(len(manifest["record_ledger"]), len(docs))
         self.assertEqual(manifest["record_ledger"]["search"]["disposition"], "unresolved_required_view")
-        self.assertEqual(manifest["record_ledger"]["helper"]["disposition"], "excluded_portal_implementation_record")
+        self.assertEqual(manifest["record_ledger"]["helper"]["disposition"], "unresolved_portal_descendant")
+        self.assertTrue(manifest["record_ledger"]["helper"]["content_bearing"])
+        self.assertEqual(manifest["record_ledger"]["empty-wrapper"]["disposition"], "unresolved_portal_descendant")
+        self.assertFalse(manifest["record_ledger"]["empty-wrapper"]["content_bearing"])
+        issue = next(x for x in manifest["issues"] if x["code"] == "unresolved_portal_descendants")
+        self.assertEqual(
+            issue["details"],
+            {"record_count": 2, "content_bearing_count": 1, "empty_wrapper_count": 1},
+        )
         self.assertNotIn("unexplained_missing_record", {issue["code"] for issue in manifest["issues"]})
+
+    def test_deleted_reference_fallback_keeps_readable_label_and_unresolved_id(self):
+        docs = [
+            rem("root", "Root"),
+            rem(
+                "body",
+                [{"i": "q", "_id": "deleted", "textOfDeletedRem": ["Readable deleted label"]}],
+                "root",
+            ),
+        ]
+        payload = {"knowledgebaseId": "synthetic-kb", "docs": docs}
+        file_map = {"root": "Sources/RemNote/Root--0000000000.md"}
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary)
+            manifest = Converter(payload, "f" * 64, (), file_map=file_map, mode="full").convert(output)
+            body = (output / file_map["root"]).read_text()
+        self.assertIn("Readable deleted label ((deleted))", body)
+        self.assertEqual(
+            manifest["source_map"]["body"]["plain_original_text"],
+            "Readable deleted label ((deleted))",
+        )
+        issue = next(x for x in manifest["issues"] if x["code"] == "unresolved_reference")
+        self.assertEqual(issue["details"], {"target_id": "deleted", "fallback_label_preserved": True})
 
     def test_full_pdf_container_keeps_annotation_text(self):
         docs = [rem("pdf", "Reference.pdf"), rem("annotation", "Readable annotation", "pdf")]

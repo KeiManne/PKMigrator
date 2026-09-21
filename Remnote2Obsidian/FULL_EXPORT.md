@@ -139,7 +139,15 @@ supported by explicit evidence. Native Markdown absence alone is not treated
 as proof that a record is disposable system metadata. References to such
 records keep their readable exported label as plain text without inventing a
 canonical link. References to IDs absent from the export retain their ID
-placeholder and an unresolved issue.
+placeholder and an unresolved issue. If the export includes a deleted-reference
+label, that label is preserved alongside the ID in both Markdown and searchable
+source text.
+
+Unrendered records owned below a portal remain `unresolved_portal_descendant`,
+including empty wrappers. Portal ancestry does not prove that a record is
+disposable query metadata: table rows and cells can contain source text there.
+These records require supported membership or context evidence before the
+migration can be accepted.
 
 `complete_full_migration` is emitted only when the converter has zero error
 issues. `incomplete_full_migration` covers unresolved automatic views, unknown
