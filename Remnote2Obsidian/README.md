@@ -1,31 +1,20 @@
-# RemNote JSON to Obsidian converter
+# RemNote to Markdown for Obsidian
 
-## Structured export with portal copies
+The current exporter is **`remnote_export.py`**. It converts structured RemNote
+data into document/topic Markdown files, copies supported portal content,
+preserves source identity and reports incomplete evidence explicitly.
 
-For a staged whole-collection migration using the structured export and native
-Markdown file boundaries, see [FULL_EXPORT.md](FULL_EXPORT.md). It emits a
-record-by-record disposition ledger and keeps unresolved views explicit.
-The [read-only snapshot plugin](remnote-snapshot/README.md) captures live portal
-evidence for reconciliation; automatic-view semantics require live calibration.
+- [Full migration](FULL_EXPORT.md): native document boundaries, reviewed scope
+  and organisation, source accounting and media reconciliation.
+- [Small pilot](PILOT.md): selected roots with strict size and recursion limits.
+- [Read-only snapshot plugin](remnote-snapshot/README.md): local capture of live
+  portal and automatic-view evidence.
 
-For a reviewable conversion of explicitly selected roots, including supported
-portal copies, stable source identities, rich text, and a structured manifest,
-see [PILOT.md](PILOT.md). Pilot mode has hard occurrence/depth limits and reports
-unsupported views as incomplete.
+Keep personal exports and generated vaults outside this public repository.
 
-The instructions below describe the original legacy converter.
+## Legacy converter
 
-## _TODO
-* [ ] include portals in bullets
-* [ ] Preserve the order of REM's as per Remnote Web app
-* [ ] Remove unnecessary files outside my personal Remnote
-
-## How to use
-
-1. Export your notes from Remnote in JSON format (remnote ouputs the data in a zip folder)
-2. Extract the ZIP folder and look for the file `rem.json`
-    * OPTIONAL: if you'd like to prettify the `rem.json` file to make it human readable, you can use the following command in terminal (after switching to the same directoty as the file): `type .\Data\rem.json | python -m json.tool > .\Data\prettyRem.json`. A new file called `prettyRem.json` will be created.
-3. Copy the file into this directory
-4. Once the file is copied, open a terminal and `cd` to this directory
-5. Finally, run the following command in terminal `python Remnote2Obsidian.py`
-6. This will create a new folder named **Rem2Obs** (folder name can be changed), with all your Remnote files and notes
+`Remnote2Obsidian.py` is the inherited converter from PKMigrator. It predates the
+staged migration workflow and does not provide its portal or reconciliation
+guarantees. Its original entrypoint is retained for compatibility; use the
+guides above for new migrations.

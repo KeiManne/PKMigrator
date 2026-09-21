@@ -3,7 +3,7 @@
   "id": "pkmigrator_remnote_snapshot",
   "name": "PKMigrator Read-Only Snapshot",
   "author": "PKMigrator contributors",
-  "repoUrl": "https://github.com/KeiManne/PKMigrator",
+  "repoUrl": "https://github.com/KeiManne/remnote-to-obsidian",
   "version": {
     "major": 0,
     "minor": 1,
