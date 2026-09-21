@@ -15,8 +15,16 @@ npm run dev
 
 In RemNote, open **Settings → Plugins → Build → Develop from localhost**, enter
 `http://localhost:8080`, install the development plugin, and open the
-**PKMigrator Read-Only Snapshot** sidebar widget. `npm run build` also produces `PluginZip.zip` for
-a local manual install. Localhost avoids publishing or uploading the plugin.
+**PKMigrator Read-Only Snapshot** sidebar widget. Use a signed-in normal browser window or the
+RemNote desktop app that can reach localhost. If an embedded browser blocks localhost, switch to
+one of those supported RemNote clients; do not route the development server through a public host.
+
+RemNote's official [quick-start guide](https://plugins.remnote.com/getting-started/quick_start_guide)
+documents **Develop from localhost** as the development-install route. `npm run build` also creates
+`PluginZip.zip`, but **Upload plugin** submits that ZIP for RemNote review and marketplace hosting;
+it is not a manual local-install control. Even an
+[unlisted plugin](https://plugins.remnote.com/advanced/unlisted_plugins) must be submitted and
+approved. Do not use **Upload plugin** merely to run this private exporter.
 
 Use **Calibration** first. Both modes take one bulk read-only inventory of the knowledge base.
 Calibration restricts the expensive portal-context and per-Rem method probes to the selected portal
