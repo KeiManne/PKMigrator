@@ -5,8 +5,10 @@ import zipfile
 from pathlib import Path
 
 from remnote_export import (
+    CHILD_ORDER_BASIS,
     Converter,
     ExportError,
+    RICH_FINGERPRINT_ALGORITHM,
     _snapshot_rich_fingerprint,
     load_export,
     load_markdown_boundaries,
@@ -30,6 +32,42 @@ def rem(rem_id, key, parent=None, order="a0", **extra):
     }
     value.update(extra)
     return value
+
+
+def snapshot_contract(docs, *, child_ids=None, portals=None, runtime=None):
+    child_ids = child_ids or {}
+    records = {
+        source["_id"]: {
+            "id": source["_id"],
+            "type": source.get("type", 0),
+            "parent_id": source.get("parent"),
+            "child_ids": child_ids.get(source["_id"], []),
+            "text": source.get("key"),
+            "back_text": source.get("value"),
+            "export_comparable_rich_text_fingerprint": _snapshot_rich_fingerprint(source),
+        }
+        for source in docs
+    }
+    return {
+        "schema_version": "remnote-migration-snapshot/v1",
+        "capture": {
+            "knowledgebase_id": "synthetic-kb",
+            "complete": True,
+            "export_comparison": {
+                "rich_text_algorithm": RICH_FINGERPRINT_ALGORITHM,
+                "structural_fields": ["id", "parent_id", "child_ids"],
+                "child_order_raw_basis": CHILD_ORDER_BASIS,
+                "raw_input_fields": ["key", "value"],
+                "sdk_input_fields": ["text", "backText"],
+                "calibrated_equivalent": True,
+                "child_order_calibrated": True,
+            },
+        },
+        "records": records,
+        "runtime_returned_records": runtime or {},
+        "portals": portals or {},
+        "converter_projection": {"portal_snapshots": {}, "visibility_overrides": {}},
+    }
 
 
 class ConverterTests(unittest.TestCase):
@@ -489,9 +527,9 @@ class ConverterTests(unittest.TestCase):
                     "missing_requested_portal_ids": [],
                 },
                 "export_comparison": {
-                    "rich_text_algorithm": "fnv1a64-canonical-richtext-v1",
+                    "rich_text_algorithm": RICH_FINGERPRINT_ALGORITHM,
                     "structural_fields": ["id", "parent_id", "child_ids"],
-                    "child_order_raw_basis": "Compare SDK children array order with raw siblings sorted by fractional f, using raw record ordinal as the tie-break.",
+                    "child_order_raw_basis": CHILD_ORDER_BASIS,
                     "raw_input_fields": ["key", "value"],
                     "sdk_input_fields": ["text", "backText"],
                     "calibrated_equivalent": True,
@@ -551,9 +589,9 @@ class ConverterTests(unittest.TestCase):
                     "missing_requested_portal_ids": [],
                 },
                 "export_comparison": {
-                    "rich_text_algorithm": "fnv1a64-canonical-richtext-v1",
+                    "rich_text_algorithm": RICH_FINGERPRINT_ALGORITHM,
                     "structural_fields": ["id", "parent_id", "child_ids"],
-                    "child_order_raw_basis": "Compare SDK children array order with raw siblings sorted by fractional f, using raw record ordinal as the tie-break.",
+                    "child_order_raw_basis": CHILD_ORDER_BASIS,
                     "raw_input_fields": ["key", "value"],
                     "sdk_input_fields": ["text", "backText"],
                     "calibrated_equivalent": True,
@@ -597,9 +635,9 @@ class ConverterTests(unittest.TestCase):
                 "knowledgebase_id": "synthetic-kb",
                 "complete": True,
                 "export_comparison": {
-                    "rich_text_algorithm": "fnv1a64-canonical-richtext-v1",
+                    "rich_text_algorithm": RICH_FINGERPRINT_ALGORITHM,
                     "structural_fields": ["id", "parent_id", "child_ids"],
-                    "child_order_raw_basis": "Compare SDK children array order with raw siblings sorted by fractional f, using raw record ordinal as the tie-break.",
+                    "child_order_raw_basis": CHILD_ORDER_BASIS,
                     "raw_input_fields": ["key", "value"],
                     "sdk_input_fields": ["text", "backText"],
                     "calibrated_equivalent": True,
@@ -629,6 +667,172 @@ class ConverterTests(unittest.TestCase):
                 load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": [drifted]})
             with self.assertRaises(ExportError):
                 load_snapshot_contract(path, {"docs": [source]})
+
+    def test_snapshot_media_url_counterparts_share_v2_fingerprint(self):
+        remote = rem(
+            "root",
+            [{"i": "i", "url": "https://remnote-user-data.s3.amazonaws.com/asset.png"}],
+        )
+        local = rem("root", [{"i": "i", "url": "%LOCAL_FILE%asset.png"}])
+        contract = snapshot_contract([remote])
+        contract["records"]["root"]["export_comparable_rich_text_fingerprint"] = _snapshot_rich_fingerprint(local)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "snapshot.json"
+            path.write_text(json.dumps(contract))
+            load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": [remote]})
+
+    def test_snapshot_media_normalization_is_path_and_asset_strict(self):
+        remote = rem(
+            "root",
+            [{
+                "i": "i",
+                "url": "https://remnote-user-data.s3.amazonaws.com/asset.png",
+                "title": "https://remnote-user-data.s3.amazonaws.com/title.png",
+            }],
+        )
+        variants = [
+            rem("root", [{"i": "i", "url": "%LOCAL_FILE%other.png", "title": remote["key"][0]["title"]}]),
+            rem("root", [{"i": "i", "url": "%LOCAL_FILE%asset.png", "title": "%LOCAL_FILE%title.png"}]),
+            rem("root", [{"i": "m", "url": "%LOCAL_FILE%asset.png", "title": remote["key"][0]["title"]}]),
+        ]
+        for variant in variants:
+            with self.subTest(variant=variant):
+                contract = snapshot_contract([remote])
+                contract["records"]["root"]["export_comparable_rich_text_fingerprint"] = _snapshot_rich_fingerprint(variant)
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "snapshot.json"
+                    path.write_text(json.dumps(contract))
+                    with self.assertRaisesRegex(ExportError, "rich_text=1"):
+                        load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": [remote]})
+
+    def test_snapshot_does_not_normalize_literal_non_media_or_other_host_urls(self):
+        pairs = [
+            (rem("root", ["https://remnote-user-data.s3.amazonaws.com/asset.png"]),
+             rem("root", ["%LOCAL_FILE%asset.png"])),
+            (rem("root", [{"i": "m", "url": "https://remnote-user-data.s3.amazonaws.com/asset.png"}]),
+             rem("root", [{"i": "m", "url": "%LOCAL_FILE%asset.png"}])),
+            (rem("root", [{"i": "i", "url": "https://assets.example.test/asset.png"}]),
+             rem("root", [{"i": "i", "url": "%LOCAL_FILE%asset.png"}])),
+        ]
+        for raw, sdk in pairs:
+            with self.subTest(raw=raw):
+                contract = snapshot_contract([raw])
+                contract["records"]["root"]["export_comparable_rich_text_fingerprint"] = _snapshot_rich_fingerprint(sdk)
+                with tempfile.TemporaryDirectory() as temporary:
+                    path = Path(temporary) / "snapshot.json"
+                    path.write_text(json.dumps(contract))
+                    with self.assertRaisesRegex(ExportError, "rich_text=1"):
+                        load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": [raw]})
+
+    def test_snapshot_rejects_lost_user_note_and_parent_change(self):
+        root = rem("root", "Root")
+        child = rem("child", "Child", "root")
+        contract = snapshot_contract([root, child], child_ids={"root": ["child"]})
+        lost = json.loads(json.dumps(contract))
+        del lost["records"]["child"]
+        moved = json.loads(json.dumps(contract))
+        moved["records"]["child"]["parent_id"] = None
+        for candidate in (lost, moved):
+            with tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "snapshot.json"
+                path.write_text(json.dumps(candidate))
+                with self.assertRaises(ExportError):
+                    load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": [root, child]})
+
+    def test_snapshot_allows_only_proven_generated_search_context_replacement(self):
+        root = rem("root", "Root")
+        search = rem("search", [{"i": "q", "_id": "query"}], "root", type=6, portalType=4)
+        old = rem(
+            "old-context", [], "search", type=6,
+            embeddedSearchId="search-id", searchResults=["source"], value=None,
+        )
+        docs = [root, search, old]
+        contract = snapshot_contract(docs, child_ids={"root": ["search"], "search": ["old-context"]})
+        del contract["records"]["old-context"]
+        contract["records"]["new-context"] = {
+            "id": "new-context", "type": 6, "parent_id": "search", "child_ids": [],
+            "text": None, "back_text": None,
+            "export_comparable_rich_text_fingerprint": _snapshot_rich_fingerprint(rem("new-context", [])),
+        }
+        contract["runtime_returned_records"]["new-context"] = {
+            "id": "new-context", "type": 6, "parent_id": "search", "child_ids": [],
+            "text": [], "back_text": None, "bulk_present": True,
+        }
+        contract["portals"]["search"] = {
+            "portal_type_name": "search_portal",
+            "nested_contexts": {"detected_ids": ["new-context"]},
+        }
+        contract["records"]["search"]["child_ids"] = ["new-context"]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "snapshot.json"
+            path.write_text(json.dumps(contract))
+            load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": docs})
+            converter = Converter(
+                {"knowledgebaseId": "synthetic-kb", "docs": docs},
+                "f" * 64,
+                (),
+                file_map={"root": "Sources/RemNote/Root--0000000000.md"},
+                mode="full",
+                snapshot_contract=contract,
+            )
+            self.assertEqual(
+                converter._build_full_record_ledger()["old-context"]["disposition"],
+                "excluded_generated_search_context",
+            )
+            missing_proof = json.loads(json.dumps(contract))
+            missing_proof["portals"]["search"]["nested_contexts"]["detected_ids"] = []
+            path.write_text(json.dumps(missing_proof))
+            with self.assertRaisesRegex(ExportError, "identities drifted"):
+                load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": docs})
+            runtime_with_child = json.loads(json.dumps(contract))
+            runtime_with_child["runtime_returned_records"]["new-context"]["child_ids"] = ["owned"]
+            path.write_text(json.dumps(runtime_with_child))
+            with self.assertRaisesRegex(ExportError, "identities drifted"):
+                load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": docs})
+            non_search_docs = json.loads(json.dumps(docs))
+            non_search_docs[1].pop("portalType")
+            path.write_text(json.dumps(contract))
+            with self.assertRaisesRegex(ExportError, "identities drifted"):
+                load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": non_search_docs})
+            owned = rem("owned", "Owned", "old-context")
+            old_with_owned_docs = docs + [owned]
+            old_with_owned = json.loads(json.dumps(contract))
+            old_with_owned["records"]["owned"] = {
+                "id": "owned", "type": 0, "parent_id": "old-context", "child_ids": [],
+                "text": ["Owned"], "back_text": None,
+                "export_comparable_rich_text_fingerprint": _snapshot_rich_fingerprint(owned),
+            }
+            path.write_text(json.dumps(old_with_owned))
+            with self.assertRaisesRegex(ExportError, "identities drifted"):
+                load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": old_with_owned_docs})
+
+    def test_snapshot_uses_complete_sdk_order_for_tied_or_null_fractional_positions(self):
+        root = rem("root", "Root")
+        first = rem("first", "First", "root", None)
+        second = rem("second", "Second", "root", None)
+        docs = [root, first, second]
+        contract = snapshot_contract(docs, child_ids={"root": ["second", "first"]})
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "snapshot.json"
+            path.write_text(json.dumps(contract))
+            load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": docs})
+        converter = Converter({"docs": docs}, "f" * 64, ["root"], snapshot_contract=contract)
+        self.assertEqual(converter.children["root"], ["second", "first"])
+
+    def test_snapshot_rejects_incomplete_sdk_children_for_unique_or_ambiguous_order(self):
+        for positions in (("a0", "a1"), (None, None)):
+            root = rem("root", "Root")
+            first = rem("first", "First", "root", positions[0])
+            second = rem("second", "Second", "root", positions[1])
+            docs = [root, first, second]
+            contract = snapshot_contract(docs, child_ids={"root": ["first"]})
+            with self.subTest(positions=positions), tempfile.TemporaryDirectory() as temporary:
+                path = Path(temporary) / "snapshot.json"
+                path.write_text(json.dumps(contract))
+                with self.assertRaisesRegex(ExportError, "child_order_unresolved=1"):
+                    load_snapshot_contract(path, {"knowledgebaseId": "synthetic-kb", "docs": docs})
+                converter = Converter({"docs": docs}, "f" * 64, ["root"], snapshot_contract=contract)
+                self.assertIn("snapshot_child_order_unresolved", {issue["code"] for issue in converter.issues})
 
     def test_rerun_removes_only_unchanged_manifest_owned_stale_files(self):
         first_payload = {"docs": [rem("one", "One"), rem("two", "Two")]}
@@ -682,9 +886,9 @@ class ConverterTests(unittest.TestCase):
                 "knowledgebase_id": "synthetic-kb",
                 "complete": True,
                 "export_comparison": {
-                    "rich_text_algorithm": "fnv1a64-canonical-richtext-v1",
+                    "rich_text_algorithm": RICH_FINGERPRINT_ALGORITHM,
                     "structural_fields": ["id", "parent_id", "child_ids"],
-                    "child_order_raw_basis": "Compare SDK children array order with raw siblings sorted by fractional f, using raw record ordinal as the tie-break.",
+                    "child_order_raw_basis": CHILD_ORDER_BASIS,
                     "raw_input_fields": ["key", "value"],
                     "sdk_input_fields": ["text", "backText"],
                     "calibrated_equivalent": True,

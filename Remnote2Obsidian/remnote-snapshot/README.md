@@ -31,7 +31,7 @@ approved. Do not use **Upload plugin** merely to run this private exporter.
 
 Use **Calibration** first. Both modes take one bulk read-only inventory of the knowledge base.
 Calibration restricts the expensive portal-context and per-Rem method probes to the selected portal
-IDs. Compare ordinary and search result membership/order and hidden/included/none states with the
+IDs. Compare ordinary and search result membership/order and portal visibility states with the
 live UI, then select only the validation checkboxes that the comparison establishes. **Complete
 migration** probes every portal, gives selected portals priority, and exposes both probe limits in
 the UI. Progress reports portal count and probes used. **Cancel** stops after the pending SDK call
@@ -78,19 +78,23 @@ missing IDs are recorded under `portals.<id>.visibility.probe_seeds`. A seed abs
 direct-member/context discovery is listed in `supplemental_ids` and forces visibility completeness
 false even when its diagnostic getter call succeeds.
 
-Each portal contains direct members in SDK return order, the document/portal context array, the
-typed-but-undocumented hidden getter's runtime-validated `hidden | included | none` result,
-collapse, ordinary/visible positions, and search/backlink metadata. `none` means no local explicit
-override; it does not prove global visibility through hidden ancestors. Collapse never hides
-content in converter projection.
+Each portal retains direct members in SDK return order, the document/portal context array,
+runtime visibility states, collapse, ordinary/visible positions, and search/backlink metadata.
+The host can return `hidden`, `included`, `root`, `tab_included`, `none`, or `undefined` from its
+visibility getter. A successful `undefined` response means no explicit local state and is
+normalized to `none`, with its raw representation retained. Failed calls and unresolved Rems
+remain failures. `none` does not prove visibility through hidden ancestors, and tab-specific
+visibility remains uncalibrated. Collapse never hides content in converter projection.
 
-`converter_projection.portal_snapshots` is emitted only after the operator validates return order
-for that portal type. `visibility_overrides` requires complete probes, valid runtime values, and
-operator validation of getter semantics. It projects `hidden` as `hidden` and `included` as
-`visible`; `none` stays in the full contract. Ordinary portal membership projection is independent
-of optional context, collapse, and position diagnostics. Search portal projection additionally
-requires successful context discovery because a failed call cannot establish that nested result
-contexts are absent.
+`converter_projection.portal_snapshots` is emitted only after the operator validates ordering
+for that portal type. SDK search arrays are diagnostic, not display order: flat search/table
+results are derived from direct members with `root` state, sorted by unique, nonnegative visible
+sibling positions. Missing or ambiguous positions prevent projection. `visibility_overrides`
+requires complete probes, valid runtime values, and operator validation of getter semantics.
+Explicit `hidden` and `included` states establish local overrides. `root` selects search result
+roots; other states stay in the full contract. Ordinary portal membership projection is independent of optional context, collapse,
+and position diagnostics. Search portal projection additionally requires successful context
+discovery because a failed call cannot establish that nested result contexts are absent.
 
 SDK Rem objects returned by portal methods are retained in `runtime_returned_records`, including
 objects absent from the bulk inventory. Runtime response objects take precedence over same-ID bulk
@@ -120,8 +124,13 @@ title.
 Each record carries `export_comparable_rich_text_fingerprint`. The algorithm canonicalizes
 `[text ?? null, backText ?? null]` by recursively sorting object keys with explicit JavaScript
 UTF-16 code-unit order, preserving array order, JSON-serializing, and applying FNV-1a 64 over
-JavaScript UTF-16 code units. Compare against raw `[key ?? null, value ?? null]` only when
+JavaScript UTF-16 code units. Version 2 also normalizes the known RemNote S3 and `%LOCAL_FILE%`
+prefixes in image-object URLs to the same asset identity. It leaves titles, ordinary strings,
+non-image links and other hosts unchanged. Compare against raw `[key ?? null, value ?? null]` only when
 `capture.export_comparison.calibrated_equivalent` is true after a real sample comparison.
-Likewise, compare each ordered `child_ids` array with raw sibling order (`f`, with raw ordinal as
-tie-break) only when `capture.export_comparison.child_order_calibrated` is true. A changed sibling
-order is migration drift even when IDs and parents are unchanged.
+Sibling membership is checked through per-record parent pointers. When bulk child arrays disagree
+with that inventory, the exporter makes bounded dedicated child-list calls and retains their
+provenance. A failed or inconsistent call never establishes a complete list. Raw fractional order
+is checked separately; null or tied order keys require a complete SDK child list rather than an
+assumed raw-export tie-break. A changed sibling order remains migration drift even when IDs and
+parents are unchanged.

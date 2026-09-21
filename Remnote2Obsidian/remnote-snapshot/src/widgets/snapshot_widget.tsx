@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from 'react';
 import { renderWidget, usePlugin } from '@remnote/plugin-sdk';
-import { buildSnapshot, downloadSnapshot, type CaptureMode, type SnapshotPlugin } from '../snapshot';
+import { buildSnapshot, downloadSnapshot, PLUGIN_VERSION, type CaptureMode, type SnapshotPlugin } from '../snapshot';
 
 const ids = (value: string): string[] =>
   value.split(/[\s,]+/).map((item) => item.trim()).filter(Boolean);
@@ -190,15 +190,15 @@ function SnapshotWidget(): JSX.Element {
 
   return (
     <div style={{ padding: 12, fontFamily: 'system-ui, sans-serif' }}>
-      <h3 style={{ margin: '0 0 8px' }}>PKMigrator snapshot</h3>
+      <h3 style={{ margin: '0 0 8px' }}>PKMigrator snapshot <small>v{PLUGIN_VERSION}</small></h3>
       <p style={{ margin: '0 0 12px', lineHeight: 1.4 }}>Reads this knowledge base and downloads one JSON file locally. It never edits Rems or uploads the snapshot.</p>
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Capture mode</span><select value={mode} disabled={running} onChange={(event) => changeMode(event.target.value as CaptureMode)}><option value="calibration">Calibration: selected portals only</option><option value="complete">Complete migration: every portal</option></select></label>
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Capture settings or document-candidates JSON</span><input type="file" accept="application/json,.json" disabled={running} onChange={(event) => loadSettingsFile(event.target.files?.[0])} /></label>
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Portal IDs (required for calibration; priority in complete mode)</span><textarea value={priorityPortals} disabled={running} onChange={(event) => setPriorityPortals(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>
       <div style={{ display: 'flex', gap: 8, marginBottom: 12 }}><label style={{ flex: 1, fontSize: 12 }}>Total context-probe limit<input type="number" min={1} step={1} value={maxContextProbes} disabled={running} onChange={(event) => setMaxContextProbes(Number(event.target.value))} style={{ boxSizing: 'border-box', width: '100%' }} /></label><label style={{ flex: 1, fontSize: 12 }}>Per-portal probe limit<input type="number" min={1} step={1} value={maxProbesPerPortal} disabled={running} onChange={(event) => setMaxProbesPerPortal(Number(event.target.value))} style={{ boxSizing: 'border-box', width: '100%' }} /></label></div>
       {checkbox(ordinaryOrderValidated, setOrdinaryOrderValidated, 'I compared ordinary-portal SDK member order with the live UI.')}
-      {checkbox(searchOrderValidated, setSearchOrderValidated, 'I compared search/backlink SDK result order with the live UI.')}
-      {checkbox(visibilitySemanticsValidated, setVisibilitySemanticsValidated, 'I compared hidden/included/none getter results with live portal state.')}
+      {checkbox(searchOrderValidated, setSearchOrderValidated, 'I compared derived search/backlink result order with the live UI.')}
+      {checkbox(visibilitySemanticsValidated, setVisibilitySemanticsValidated, 'I compared captured visibility states with live portal state.')}
       {checkbox(richTextFingerprintCalibrated, setRichTextFingerprintCalibrated, 'I compared canonical SDK rich-text fingerprints with the matching raw export records.')}
       {checkbox(childOrderCalibrated, setChildOrderCalibrated, 'I compared SDK child array order with raw fractional-f sibling order.')}
       <label style={{ display: 'block', marginBottom: 12 }}><span style={{ display: 'block', marginBottom: 4, fontSize: 12 }}>Known hidden IDs by portal, as JSON (optional)</span><textarea value={expectedHiddenByPortal} disabled={running} onChange={(event) => setExpectedHiddenByPortal(event.target.value)} rows={3} style={{ boxSizing: 'border-box', width: '100%', padding: 6 }} /></label>

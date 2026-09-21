@@ -11,12 +11,16 @@ interface MockOptions {
   type?: number;
   parent?: string | null;
   children?: string[];
+  childRems?: MockRem[];
+  childrenThrows?: boolean;
+  childCalls?: string[];
   text?: RichTextInterface;
   portalType?: number;
   members?: MockRem[];
   context?: MockRem[];
   contextThrows?: boolean;
   hidden?: HiddenState | string;
+  hiddenRuntime?: HiddenState | string | undefined;
   collapsed?: boolean;
   collapseThrows?: boolean;
   positionThrows?: boolean;
@@ -27,6 +31,7 @@ interface MockOptions {
   document?: boolean;
   folder?: boolean;
   powerup?: boolean;
+  slotCalls?: string[];
 }
 
 class MockRem implements SnapshotRem {
@@ -53,6 +58,11 @@ class MockRem implements SnapshotRem {
   async getPortalType(): Promise<number> {
     return this.options.portalType ?? PORTAL_TYPE.PORTAL;
   }
+  async getChildrenRem(): Promise<MockRem[]> {
+    this.options.childCalls?.push(this._id);
+    if (this.options.childrenThrows) throw new Error('children unavailable');
+    return this.options.childRems ?? [];
+  }
   async getPortalDirectlyIncludedRem(): Promise<MockRem[]> {
     return this.options.members ?? [];
   }
@@ -72,12 +82,17 @@ class MockRem implements SnapshotRem {
     return this.options.visiblePosition;
   }
   async getHiddenExplicitlyIncludedState(): Promise<HiddenState | undefined> {
+    if ('hiddenRuntime' in this.options) {
+      return this.options.hiddenRuntime as HiddenState | undefined;
+    }
     return (this.options.hidden ?? 'none') as HiddenState;
   }
-  async getPowerupPropertyAsRem(): Promise<MockRem | undefined> {
+  async getPowerupPropertyAsRem(_powerup: string, slot: string): Promise<MockRem | undefined> {
+    this.options.slotCalls?.push(`rem:${slot}`);
     return this.options.backlinkTarget;
   }
   async getPowerupPropertyAsRichText(_powerup: string, slot: string): Promise<RichTextInterface> {
+    this.options.slotCalls?.push(`rich:${slot}`);
     return [`slot:${slot}`];
   }
   async remsReferencingThis(): Promise<MockRem[]> {
@@ -114,7 +129,13 @@ test('captures ordered portal/search state and emits conservative converter proj
   });
   const backlink = new MockRem({ id: 'backlink', parent: 'source-root' });
   const target = new MockRem({ id: 'target', backlinks: [backlink] });
-  const result = new MockRem({ id: 'search-result', parent: 'source-root' });
+  const result = new MockRem({
+    id: 'search-result',
+    parent: 'source-root',
+    hidden: 'root',
+    position: 0,
+    visiblePosition: 0,
+  });
   const ordinaryPortal = new MockRem({
     id: 'ordinary-portal',
     type: RemType.PORTAL,
@@ -282,6 +303,281 @@ test('rejects an unexpected hidden getter runtime value', async () => {
   assert.equal(snapshot.capture.migration_complete, false);
   assert.equal(snapshot.converter_projection.visibility_overrides.portal, undefined);
   assert.ok(snapshot.errors.some((error) => error.operation.endsWith('.runtime-value')));
+});
+
+test('normalizes a successful undefined hidden result to none while preserving the wire value', async () => {
+  const source = new MockRem({
+    id: 'source',
+    hiddenRuntime: undefined,
+    position: 0,
+    visiblePosition: 0,
+  });
+  const portal = new MockRem({ id: 'portal', type: RemType.PORTAL, members: [source] });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [portal, source] },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'complete',
+    ordinaryOrderValidated: true,
+    visibilitySemanticsValidated: true,
+  });
+
+  assert.equal(snapshot.portals.portal.visibility.states.source, 'none');
+  assert.equal(snapshot.portals.portal.visibility.raw_states.source, 'undefined');
+  assert.equal(snapshot.portals.portal.visibility.complete, true);
+  assert.ok(
+    !snapshot.errors.some(
+      (error) => error.operation === 'Rem.getHiddenExplicitlyIncludedState',
+    ),
+  );
+});
+
+test('normalizes only recognized media-object URL prefixes in comparable rich-text fingerprints', async () => {
+  const remote = new MockRem({
+    id: 'remote',
+    text: [
+      {
+        i: 'i',
+        url: 'https://remnote-user-data.s3.amazonaws.com/folder/asset.png?token=literal',
+        title: 'https://remnote-user-data.s3.amazonaws.com/title-must-stay-literal',
+      },
+    ] as RichTextInterface,
+  });
+  const local = new MockRem({
+    id: 'local',
+    text: [
+      {
+        i: 'i',
+        url: '%LOCAL_FILE%folder/asset.png?token=literal',
+        title: 'https://remnote-user-data.s3.amazonaws.com/title-must-stay-literal',
+      },
+    ] as RichTextInterface,
+  });
+  const nonMedia = new MockRem({
+    id: 'non-media',
+    text: [
+      { i: 'm', url: '%LOCAL_FILE%folder/asset.png?token=literal' },
+    ] as RichTextInterface,
+  });
+  const changedTitle = new MockRem({
+    id: 'changed-title',
+    text: [
+      {
+        i: 'i',
+        url: '%LOCAL_FILE%folder/asset.png?token=literal',
+        title: '%LOCAL_FILE%title-must-stay-literal',
+      },
+    ] as RichTextInterface,
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [remote, local, nonMedia, changedTitle] },
+  };
+
+  const snapshot = await buildSnapshot(plugin, () => undefined, { mode: 'complete' });
+  const remoteFingerprint = snapshot.records.remote.export_comparable_rich_text_fingerprint;
+  assert.equal(remoteFingerprint, snapshot.records.local.export_comparable_rich_text_fingerprint);
+  assert.notEqual(
+    remoteFingerprint,
+    snapshot.records['non-media'].export_comparable_rich_text_fingerprint,
+  );
+  assert.notEqual(
+    remoteFingerprint,
+    snapshot.records['changed-title'].export_comparable_rich_text_fingerprint,
+  );
+  assert.match(remoteFingerprint, /^fnv1a64-canonical-richtext-v2-media-url:/);
+  assert.equal(
+    snapshot.capture.export_comparison.media_url_normalization.sentinel,
+    '%REMNOTE_ASSET%',
+  );
+});
+
+test('repairs only bulk child-membership mismatches with a parent-consistent getChildrenRem result', async () => {
+  const childCalls: string[] = [];
+  const kept = new MockRem({ id: 'kept', parent: 'filtered-parent' });
+  const omitted = new MockRem({ id: 'omitted', parent: 'filtered-parent' });
+  const filteredParent = new MockRem({
+    id: 'filtered-parent',
+    children: ['kept'],
+    childRems: [omitted, kept],
+    childCalls,
+  });
+  const completeChild = new MockRem({ id: 'complete-child', parent: 'complete-parent' });
+  const completeParent = new MockRem({
+    id: 'complete-parent',
+    children: ['complete-child'],
+    childRems: [],
+    childCalls,
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: {
+      getAll: async () => [
+        filteredParent,
+        kept,
+        omitted,
+        completeParent,
+        completeChild,
+      ],
+    },
+  };
+
+  const snapshot = await buildSnapshot(plugin, () => undefined, { mode: 'complete' });
+  assert.deepEqual(snapshot.records['filtered-parent'].bulk_child_ids, ['kept']);
+  assert.deepEqual(snapshot.records['filtered-parent'].child_ids, ['omitted', 'kept']);
+  assert.equal(snapshot.records['filtered-parent'].child_ids_source, 'getChildrenRem');
+  assert.equal(snapshot.records['filtered-parent'].child_ids_probe, 'verified');
+  assert.equal(snapshot.records['complete-parent'].child_ids_probe, 'not-needed');
+  assert.deepEqual(childCalls, ['filtered-parent']);
+  assert.deepEqual(snapshot.capture.export_comparison.child_membership_probe, {
+    complete: true,
+    mismatch_parent_count: 1,
+    attempted: 1,
+    verified: 1,
+    failed: 0,
+    skipped_by_limit: 0,
+    method: 'Rem.getChildrenRem',
+  });
+});
+
+test('retains bulk children and marks structural evidence incomplete when getChildrenRem fails', async () => {
+  const child = new MockRem({ id: 'child', parent: 'parent' });
+  const parent = new MockRem({ id: 'parent', children: [], childrenThrows: true });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [parent, child] },
+  };
+
+  const snapshot = await buildSnapshot(plugin, () => undefined, { mode: 'complete' });
+  assert.deepEqual(snapshot.records.parent.child_ids, []);
+  assert.deepEqual(snapshot.records.parent.bulk_child_ids, []);
+  assert.equal(snapshot.records.parent.child_ids_source, 'bulk');
+  assert.equal(snapshot.records.parent.child_ids_probe, 'failed');
+  assert.equal(snapshot.capture.export_comparison.child_membership_probe.complete, false);
+  assert.equal(snapshot.capture.diagnostics_complete, false);
+  assert.ok(snapshot.errors.some((error) => error.operation === 'Rem.getChildrenRem'));
+});
+
+test('derives flat search roots from root state and visible sibling positions', async () => {
+  const slotCalls: string[] = [];
+  const first = new MockRem({
+    id: 'first',
+    hidden: 'root',
+    position: 4,
+    visiblePosition: 0,
+  });
+  const descendant = new MockRem({
+    id: 'descendant',
+    parent: 'second',
+    hiddenRuntime: undefined,
+    position: 0,
+    visiblePosition: 0,
+  });
+  const second = new MockRem({
+    id: 'second',
+    children: ['descendant'],
+    hidden: 'root',
+    position: 2,
+    visiblePosition: 1,
+  });
+  const search = new MockRem({
+    id: 'search',
+    type: RemType.PORTAL,
+    portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    members: [second, descendant, first],
+    context: [second, descendant, first],
+    slotCalls,
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [search, first, second, descendant] },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'complete',
+    searchOrderValidated: true,
+    visibilitySemanticsValidated: true,
+  });
+
+  assert.deepEqual(snapshot.portals.search.membership.member_ids, [
+    'second',
+    'descendant',
+    'first',
+  ]);
+  assert.deepEqual(snapshot.portals.search.automatic_view?.root_result_ids, [
+    'first',
+    'second',
+  ]);
+  assert.equal(snapshot.portals.search.automatic_view?.root_result_complete, true);
+  assert.deepEqual(snapshot.converter_projection.portal_snapshots.search.members, [
+    'first',
+    'second',
+  ]);
+  assert.deepEqual(slotCalls, [
+    'rich:Query',
+    'rich:Filter',
+    'rich:DontIncludeNestedDescendants',
+    'rem:AutomaticBacklinkSearchPortalFor',
+  ]);
+});
+
+test('blocks derived search projection when root positions are duplicated', async () => {
+  const first = new MockRem({ id: 'first', hidden: 'root', visiblePosition: 0 });
+  const second = new MockRem({ id: 'second', hidden: 'root', visiblePosition: 0 });
+  const search = new MockRem({
+    id: 'search',
+    type: RemType.PORTAL,
+    portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    members: [first, second],
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [search, first, second] },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'complete',
+    searchOrderValidated: true,
+    visibilitySemanticsValidated: true,
+  });
+
+  assert.equal(snapshot.portals.search.automatic_view?.root_result_complete, false);
+  assert.equal(snapshot.portals.search.automatic_view?.root_result_ids, null);
+  assert.equal(snapshot.converter_projection.portal_snapshots.search, undefined);
+  assert.ok(snapshot.errors.some((error) => error.operation === 'search-root-result-order'));
+});
+
+test('captures tab_included but keeps search projection closed until its meaning is calibrated', async () => {
+  const tab = new MockRem({ id: 'tab', hidden: 'tab_included', visiblePosition: 0 });
+  const search = new MockRem({
+    id: 'search',
+    type: RemType.PORTAL,
+    portalType: PORTAL_TYPE.SEARCH_PORTAL,
+    members: [tab],
+  });
+  const plugin: SnapshotPlugin = {
+    app: { waitForInitialSync: async () => undefined, getPlatform: async () => 'web' },
+    kb: { getCurrentKnowledgeBaseData: async () => ({ _id: 'kb', name: 'KB' }) },
+    rem: { getAll: async () => [search, tab] },
+  };
+  const snapshot = await buildSnapshot(plugin, () => undefined, {
+    mode: 'complete',
+    searchOrderValidated: true,
+    visibilitySemanticsValidated: true,
+  });
+
+  assert.equal(snapshot.portals.search.visibility.states.tab, 'tab_included');
+  assert.equal(snapshot.portals.search.visibility.raw_states.tab, 'tab_included');
+  assert.equal(snapshot.portals.search.automatic_view?.root_result_complete, false);
+  assert.equal(snapshot.converter_projection.portal_snapshots.search, undefined);
+  assert.ok(
+    snapshot.errors.some((error) => error.operation === 'visibility-tab-included-unvalidated'),
+  );
 });
 
 test('detects a knowledge-base switch and removes converter projections', async () => {

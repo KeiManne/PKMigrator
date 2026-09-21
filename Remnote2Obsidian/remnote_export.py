@@ -291,13 +291,167 @@ def _canonical_javascript_json_value(value: Any) -> Any:
     return value
 
 
+RICH_FINGERPRINT_ALGORITHM = "fnv1a64-canonical-richtext-v2-media-url"
+CHILD_ORDER_BASIS = (
+    "Raw siblings use null-first fractional f; every SDK child array must have complete "
+    "parent-consistent membership; SDK order resolves null/tied f."
+)
+REMOTE_MEDIA_PREFIX = "https://remnote-user-data.s3.amazonaws.com/"
+LOCAL_MEDIA_PREFIX = "%LOCAL_FILE%"
+CANONICAL_MEDIA_PREFIX = "%REMNOTE_ASSET%"
+
+
+def _canonical_rich_text_value(value: Any) -> Any:
+    if isinstance(value, list):
+        return [_canonical_rich_text_value(item) for item in value]
+    if isinstance(value, dict):
+        normalized = {key: _canonical_rich_text_value(item) for key, item in value.items()}
+        url = value.get("url")
+        if value.get("i") == "i" and isinstance(url, str):
+            for prefix in (REMOTE_MEDIA_PREFIX, LOCAL_MEDIA_PREFIX):
+                if url.startswith(prefix):
+                    normalized["url"] = CANONICAL_MEDIA_PREFIX + url[len(prefix):]
+                    break
+        return normalized
+    return value
+
+
 def _snapshot_rich_fingerprint(raw: dict[str, Any]) -> str:
     serialized = json.dumps(
-        _canonical_javascript_json_value([raw.get("key"), raw.get("value")]),
+        _canonical_javascript_json_value(
+            _canonical_rich_text_value([raw.get("key"), raw.get("value")])
+        ),
         ensure_ascii=False,
         separators=(",", ":"),
     )
-    return "fnv1a64-canonical-richtext-v1:" + _fnv1a64_javascript(serialized)
+    return RICH_FINGERPRINT_ALGORITHM + ":" + _fnv1a64_javascript(serialized)
+
+
+def _empty_rich_record(record: dict[str, Any], *, raw: bool) -> bool:
+    return (
+        record.get("key" if raw else "text") == []
+        and record.get("value" if raw else "back_text") is None
+    )
+
+
+def _generated_context_identity_exemptions(
+    contract: dict[str, Any],
+    exported: dict[str, dict[str, Any]],
+    records: dict[str, dict[str, Any]],
+) -> tuple[set[str], set[str]]:
+    portals = contract.get("portals")
+    runtime = contract.get("runtime_returned_records")
+    if not isinstance(portals, dict) or not isinstance(runtime, dict):
+        return set(), set()
+    export_only = set(exported) - set(records)
+    snapshot_only = set(records) - set(exported)
+    exported_children = Counter(
+        raw.get("parent") for raw in exported.values() if isinstance(raw.get("parent"), str)
+    )
+    snapshot_children = Counter(
+        record.get("parent_id") for record in records.values()
+        if isinstance(record, dict) and isinstance(record.get("parent_id"), str)
+    )
+    empty_fingerprint = _snapshot_rich_fingerprint({"key": [], "value": None})
+    ignored_export: set[str] = set()
+    ignored_snapshot: set[str] = set()
+    for parent_id, portal in portals.items():
+        if not isinstance(portal, dict) or portal.get("portal_type_name") != "search_portal":
+            continue
+        parent_raw = exported.get(parent_id)
+        parent_sdk = records.get(parent_id)
+        nested = portal.get("nested_contexts")
+        detected = set(nested.get("detected_ids", [])) if isinstance(nested, dict) else set()
+        if (
+            not isinstance(parent_raw, dict)
+            or not isinstance(parent_sdk, dict)
+            or parent_raw.get("portalType") != 4
+            or parent_sdk.get("parent_id") != (
+                parent_raw.get("parent") if isinstance(parent_raw.get("parent"), str) else None
+            )
+            or parent_sdk.get("export_comparable_rich_text_fingerprint")
+            != _snapshot_rich_fingerprint(parent_raw)
+        ):
+            continue
+        old_ids = {
+            rem_id for rem_id in export_only
+            if exported[rem_id].get("type") == 6
+            and exported[rem_id].get("parent") == parent_id
+            and "embeddedSearchId" in exported[rem_id]
+            and "searchResults" in exported[rem_id]
+            and _empty_rich_record(exported[rem_id], raw=True)
+            and exported_children[rem_id] == 0
+        }
+        new_ids = {
+            rem_id for rem_id in snapshot_only
+            if records[rem_id].get("type") == 6
+            and records[rem_id].get("parent_id") == parent_id
+            and rem_id in detected
+            and isinstance(runtime.get(rem_id), dict)
+            and runtime[rem_id].get("type") == 6
+            and runtime[rem_id].get("parent_id") == parent_id
+            and runtime[rem_id].get("child_ids") == []
+            and _empty_rich_record(runtime[rem_id], raw=False)
+            and snapshot_children[rem_id] == 0
+            and records[rem_id].get("export_comparable_rich_text_fingerprint") == empty_fingerprint
+        }
+        if old_ids and len(old_ids) == len(new_ids):
+            ignored_export.update(old_ids)
+            ignored_snapshot.update(new_ids)
+    return ignored_export, ignored_snapshot
+
+
+def _derive_snapshot_children(
+    exported: dict[str, dict[str, Any]],
+    records: dict[str, dict[str, Any]],
+    ignored_export: set[str] | None = None,
+    ignored_snapshot: set[str] | None = None,
+) -> tuple[dict[str, list[str]], Counter[str]]:
+    ignored_export = ignored_export or set()
+    ignored_snapshot = ignored_snapshot or set()
+    ordinal = {rem_id: position for position, rem_id in enumerate(exported)}
+    children: dict[str, list[str]] = defaultdict(list)
+    for rem_id, raw in exported.items():
+        if rem_id in ignored_export:
+            continue
+        parent = raw.get("parent")
+        if isinstance(parent, str) and parent in exported:
+            children[parent].append(rem_id)
+    mismatches: Counter[str] = Counter()
+    for parent in exported:
+        if parent in ignored_export:
+            continue
+        child_ids = children.get(parent, [])
+        raw_order = sorted(
+            child_ids,
+            key=lambda rem_id: (
+                exported[rem_id].get("f") is not None,
+                str(exported[rem_id].get("f") or ""),
+                ordinal[rem_id],
+            ),
+        )
+        observed = records.get(parent, {}).get("child_ids")
+        sdk_order = (
+            [rem_id for rem_id in observed if rem_id not in ignored_snapshot]
+            if isinstance(observed, list) and all(isinstance(rem_id, str) for rem_id in observed)
+            else []
+        )
+        membership_complete = Counter(sdk_order) == Counter(raw_order)
+        parent_consistent = membership_complete and all(
+            records.get(rem_id, {}).get("parent_id") == parent for rem_id in sdk_order
+        )
+        f_values = [exported[rem_id].get("f") for rem_id in child_ids]
+        unambiguous = all(value is not None for value in f_values) and len(set(f_values)) == len(f_values)
+        if not parent_consistent:
+            children[parent] = raw_order
+            mismatches["child_order_unresolved"] += 1
+        elif unambiguous:
+            children[parent] = raw_order
+            if sdk_order != raw_order:
+                mismatches["child_order"] += 1
+        else:
+            children[parent] = sdk_order
+    return dict(children), mismatches
 
 
 def _validate_snapshot_drift(contract: dict[str, Any], payload: dict[str, Any]) -> None:
@@ -309,8 +463,9 @@ def _validate_snapshot_drift(contract: dict[str, Any], payload: dict[str, Any]) 
         for raw in payload.get("docs", [])
         if isinstance(raw, dict) and isinstance(raw.get("_id"), str)
     }
-    snapshot_ids = set(records)
-    export_ids = set(exported)
+    ignored_export, ignored_snapshot = _generated_context_identity_exemptions(contract, exported, records)
+    snapshot_ids = set(records) - ignored_snapshot
+    export_ids = set(exported) - ignored_export
     if snapshot_ids != export_ids:
         raise ExportError(
             "snapshot/export record identities drifted "
@@ -319,26 +474,18 @@ def _validate_snapshot_drift(contract: dict[str, Any], payload: dict[str, Any]) 
     comparison = contract.get("capture", {}).get("export_comparison")
     if (
         not isinstance(comparison, dict)
-        or comparison.get("rich_text_algorithm") != "fnv1a64-canonical-richtext-v1"
+        or comparison.get("rich_text_algorithm") != RICH_FINGERPRINT_ALGORITHM
         or comparison.get("structural_fields") != ["id", "parent_id", "child_ids"]
-        or comparison.get("child_order_raw_basis")
-        != "Compare SDK children array order with raw siblings sorted by fractional f, using raw record ordinal as the tie-break."
+        or comparison.get("child_order_raw_basis") != CHILD_ORDER_BASIS
         or comparison.get("raw_input_fields") != ["key", "value"]
         or comparison.get("sdk_input_fields") != ["text", "backText"]
     ):
         raise ExportError("snapshot contract lacks the supported export-comparable rich-text algorithm")
     compare_rich_text = comparison.get("calibrated_equivalent") is True
     compare_child_order = comparison.get("child_order_calibrated") is True
-    ordinal = {rem_id: position for position, rem_id in enumerate(exported)}
-    exported_children: dict[str, list[str]] = defaultdict(list)
-    for rem_id, raw in exported.items():
-        parent = raw.get("parent")
-        if isinstance(parent, str) and parent in exported:
-            exported_children[parent].append(rem_id)
-    for parent, child_ids in exported_children.items():
-        child_ids.sort(key=lambda rem_id: (str(exported[rem_id].get("f", "~")), ordinal[rem_id]))
     mismatches: Counter[str] = Counter()
-    for rem_id, raw in exported.items():
+    for rem_id in sorted(export_ids):
+        raw = exported[rem_id]
         observed = records.get(rem_id)
         if not isinstance(observed, dict) or observed.get("id") != rem_id:
             mismatches["invalid_record"] += 1
@@ -346,10 +493,13 @@ def _validate_snapshot_drift(contract: dict[str, Any], payload: dict[str, Any]) 
         raw_parent = raw.get("parent") if isinstance(raw.get("parent"), str) else None
         if observed.get("parent_id") != raw_parent:
             mismatches["parent"] += 1
-        if compare_child_order and observed.get("child_ids") != exported_children.get(rem_id, []):
-            mismatches["child_order"] += 1
         if compare_rich_text and observed.get("export_comparable_rich_text_fingerprint") != _snapshot_rich_fingerprint(raw):
             mismatches["rich_text"] += 1
+    if compare_child_order:
+        _, child_mismatches = _derive_snapshot_children(
+            exported, records, ignored_export, ignored_snapshot
+        )
+        mismatches.update(child_mismatches)
     if mismatches:
         summary = ", ".join(f"{name}={count}" for name, count in sorted(mismatches.items()))
         raise ExportError(f"snapshot/export record drift detected ({summary})")
@@ -488,6 +638,8 @@ class Converter:
         self._occurrences = 0
         self._budget_reported = False
         self._referenced_canonical: set[str] = set()
+        self._generated_context_export_ids: set[str] = set()
+        self._generated_context_snapshot_ids: set[str] = set()
         self._prepare_index()
         if self.full_mode:
             for rem_id in self.split_candidates:
@@ -602,15 +754,30 @@ class Converter:
         capture = self.snapshot_contract.get("capture", {})
         scope = capture.get("scope")
         portals = self.snapshot_contract.get("portals")
-        exported_portals = {rem_id for rem_id, raw in self.index.items() if raw.get("type") == 6}
-        captured_portals = set(portals) if isinstance(portals, dict) else set()
+        records = self.snapshot_contract.get("records")
+        ignored_export, ignored_snapshot = (
+            _generated_context_identity_exemptions(self.snapshot_contract, self.index, records)
+            if isinstance(records, dict)
+            else (set(), set())
+        )
+        exported_portals = {
+            rem_id for rem_id, raw in self.index.items()
+            if raw.get("type") == 6 and rem_id not in ignored_export
+        }
+        captured_portals = (
+            set(portals) - ignored_snapshot if isinstance(portals, dict) else set()
+        )
+        expected_portal_count = scope.get("expected_portal_count") if isinstance(scope, dict) else None
+        processed_portal_count = scope.get("processed_portal_count") if isinstance(scope, dict) else None
         scope_complete = (
             capture.get("mode") == "complete"
             and capture.get("knowledgebase_consistent") is True
             and capture.get("knowledgebase_id_at_end") == capture.get("knowledgebase_id")
             and isinstance(scope, dict)
-            and scope.get("expected_portal_count") == len(exported_portals)
-            and scope.get("processed_portal_count") == len(exported_portals)
+            and isinstance(expected_portal_count, int)
+            and expected_portal_count - len(ignored_snapshot) == len(exported_portals)
+            and isinstance(processed_portal_count, int)
+            and processed_portal_count - len(ignored_snapshot) == len(exported_portals)
             and scope.get("missing_requested_portal_ids") == []
             and captured_portals == exported_portals
         )
@@ -637,13 +804,39 @@ class Converter:
                 self.issue("duplicate_id", "error", "Duplicate Rem ID", rem_id=rem_id)
                 continue
             self.index[rem_id] = raw
-        order = {rid: i for i, rid in enumerate(self.index)}
-        for rem_id, raw in self.index.items():
-            parent = raw.get("parent")
-            if isinstance(parent, str):
-                self.children[parent].append(rem_id)
-        for parent, ids in self.children.items():
-            ids.sort(key=lambda rid: (str(self.index[rid].get("f", "~")), order[rid]))
+        if self.snapshot_contract is not None and isinstance(self.snapshot_contract.get("records"), dict):
+            records = self.snapshot_contract["records"]
+            ignored_export, ignored_snapshot = _generated_context_identity_exemptions(
+                self.snapshot_contract, self.index, records
+            )
+            self._generated_context_export_ids = ignored_export
+            self._generated_context_snapshot_ids = ignored_snapshot
+            derived, order_mismatches = _derive_snapshot_children(
+                self.index, records, ignored_export, ignored_snapshot
+            )
+            self.children.update(derived)
+            if order_mismatches.get("child_order"):
+                self.issue(
+                    "snapshot_child_order_conflict",
+                    "error",
+                    "Live SDK child order disagrees with unambiguous raw fractional order",
+                    details={"parent_count": order_mismatches["child_order"]},
+                )
+            if order_mismatches.get("child_order_unresolved"):
+                self.issue(
+                    "snapshot_child_order_unresolved",
+                    "error",
+                    "SDK child membership is incomplete or parent-inconsistent, so calibrated sibling order cannot be established",
+                    details={"parent_count": order_mismatches["child_order_unresolved"]},
+                )
+        else:
+            order = {rid: i for i, rid in enumerate(self.index)}
+            for rem_id, raw in self.index.items():
+                parent = raw.get("parent")
+                if isinstance(parent, str):
+                    self.children[parent].append(rem_id)
+            for parent, ids in self.children.items():
+                ids.sort(key=lambda rid: (str(self.index[rid].get("f", "~")), order[rid]))
         for root in self.roots:
             if root not in self.index:
                 self.issue("missing_root", "error", "Requested root is absent from export", rem_id=root)
@@ -1106,7 +1299,12 @@ class Converter:
                 "canonical": source.get("canonical") if source else None,
                 "occurrence_count": len(source.get("occurrences", [])) if source else 0,
             }
-            if raw.get("type") == 6:
+            if rem_id in self._generated_context_export_ids:
+                entry.update(
+                    disposition="excluded_generated_search_context",
+                    reason="Paired export/snapshot/runtime evidence identifies this empty type-6 record as a replaced generated search-context node.",
+                )
+            elif raw.get("type") == 6:
                 if owner is None:
                     if self._is_evidenced_system_definition(rem_id):
                         entry.update(

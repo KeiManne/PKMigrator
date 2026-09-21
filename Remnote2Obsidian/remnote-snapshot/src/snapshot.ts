@@ -10,10 +10,11 @@ const PORTAL_TYPE = {
 
 export const SNAPSHOT_SCHEMA_VERSION = 'remnote-migration-snapshot/v1' as const;
 export const SDK_VERSION = '0.0.46';
-export const PLUGIN_VERSION = '0.1.0';
+export const PLUGIN_VERSION = '0.1.1';
 
 export type Progress = (message: string) => void;
-export type HiddenState = 'hidden' | 'included' | 'none';
+export type HiddenState = 'hidden' | 'included' | 'root' | 'tab_included' | 'none';
+export type HiddenRuntimeValue = HiddenState | 'undefined' | 'unknown';
 export type CaptureMode = 'calibration' | 'complete';
 
 export interface CaptureOptions {
@@ -46,6 +47,7 @@ export interface SnapshotRem {
   readonly type: number;
   readonly text: RichTextInterface | undefined;
   readonly backText?: RichTextInterface;
+  getChildrenRem?(): Promise<SnapshotRem[]>;
   getPortalType(): Promise<number>;
   getPortalDirectlyIncludedRem(): Promise<SnapshotRem[]>;
   allRemInDocumentOrPortal(): Promise<SnapshotRem[]>;
@@ -96,6 +98,15 @@ export interface SourceRecord {
   type: number;
   parent_id: string | null;
   child_ids: string[];
+  bulk_child_ids: string[];
+  child_ids_source: 'bulk' | 'getChildrenRem';
+  child_ids_probe:
+    | 'not-needed'
+    | 'verified'
+    | 'method-unavailable'
+    | 'failed'
+    | 'inconsistent'
+    | 'limit-exceeded';
   text: RichTextInterface | null;
   back_text: RichTextInterface | null;
   created_at: number;
@@ -147,6 +158,13 @@ export interface PortalRecord {
     sdk_status: 'typed-but-undocumented';
     candidate_ids: string[];
     states: Record<string, HiddenState | 'unknown'>;
+    raw_states: Record<string, HiddenRuntimeValue>;
+    runtime_contract: {
+      source: 'public-host-implementation-and-live-calibration';
+      sdk_declaration_complete: false;
+      resolved_undefined_means: 'none';
+      tab_included_projection: 'unvalidated';
+    };
     runtime_values_valid: boolean;
     semantics_validation: 'operator-ui-validated' | 'unverified';
     expected_hidden_ids: string[];
@@ -182,6 +200,10 @@ export interface PortalRecord {
       | 'direct-members'
       | 'direct-members-unmapped-nested-contexts'
       | 'direct-members-context-discovery-incomplete';
+    root_result_ids: string[] | null;
+    root_result_complete: boolean;
+    root_result_order: 'visible-sibling-position' | null;
+    root_result_blockers: string[];
     backlink_target_id: string | null;
     query: RichTextInterface | null;
     filter: RichTextInterface | null;
@@ -233,6 +255,7 @@ export interface MigrationSnapshot {
       max_context_probes: number;
       max_probes_per_portal: number;
       max_detailed_members_per_portal: number;
+      max_child_membership_probes: 256;
     };
     scope: {
       expected_portal_count: number;
@@ -250,7 +273,22 @@ export interface MigrationSnapshot {
       structural_fields: ['id', 'parent_id', 'child_ids'];
       child_order_calibrated: boolean;
       child_order_raw_basis: string;
-      rich_text_algorithm: 'fnv1a64-canonical-richtext-v1';
+      child_membership_probe: {
+        complete: boolean;
+        mismatch_parent_count: number;
+        attempted: number;
+        verified: number;
+        failed: number;
+        skipped_by_limit: number;
+        method: 'Rem.getChildrenRem';
+      };
+      rich_text_algorithm: 'fnv1a64-canonical-richtext-v2-media-url';
+      media_url_normalization: {
+        scope: 'rich-text-media-object-url-only';
+        media_type: 'i';
+        prefixes: ['https://remnote-user-data.s3.amazonaws.com/', '%LOCAL_FILE%'];
+        sentinel: '%REMNOTE_ASSET%';
+      };
       raw_input_fields: ['key', 'value'];
       sdk_input_fields: ['text', 'backText'];
       calibrated_equivalent: boolean;
@@ -329,6 +367,7 @@ const API_METHODS = [
   'KnowledgeBase.getCurrentKnowledgeBaseData',
   'RemNamespace.getAll',
   'RemNamespace.findOne',
+  'Rem.getChildrenRem',
   'Rem.getPortalType',
   'Rem.getPortalDirectlyIncludedRem',
   'Rem.allRemInDocumentOrPortal',
@@ -380,6 +419,33 @@ function canonicalJsonValue(value: unknown): unknown {
         .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
         .map(([key, item]) => [key, canonicalJsonValue(item)]),
     );
+  }
+  return value;
+}
+
+function normalizeComparableMediaUrls(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(normalizeComparableMediaUrls);
+  if (value !== null && typeof value === 'object') {
+    const source = value as Record<string, unknown>;
+    const normalized = Object.fromEntries(
+      Object.entries(source).map(([key, item]) => [key, normalizeComparableMediaUrls(item)]),
+    );
+    if (
+      source.i === 'i' &&
+      Object.prototype.hasOwnProperty.call(source, 'url') &&
+      typeof source.url === 'string'
+    ) {
+      for (const prefix of [
+        'https://remnote-user-data.s3.amazonaws.com/',
+        '%LOCAL_FILE%',
+      ] as const) {
+        if (source.url.startsWith(prefix)) {
+          normalized.url = `%REMNOTE_ASSET%${source.url.slice(prefix.length)}`;
+          break;
+        }
+      }
+    }
+    return normalized;
   }
   return value;
 }
@@ -571,7 +637,9 @@ export async function buildSnapshot(
   const recordEntries = allRem.map((rem): [string, SourceRecord] => {
     const richTextPair = [rem.text ?? null, rem.backText ?? null];
     const richFingerprint = fnv1a64(JSON.stringify(richTextPair));
-    const comparableFingerprint = fnv1a64(JSON.stringify(canonicalJsonValue(richTextPair)));
+    const comparableFingerprint = fnv1a64(
+      JSON.stringify(canonicalJsonValue(normalizeComparableMediaUrls(richTextPair))),
+    );
     return [
       rem._id,
       {
@@ -579,6 +647,9 @@ export async function buildSnapshot(
         type: rem.type,
         parent_id: rem.parent,
         child_ids: [...(rem.children ?? [])],
+        bulk_child_ids: [...(rem.children ?? [])],
+        child_ids_source: 'bulk',
+        child_ids_probe: 'not-needed',
         text: null,
         back_text: null,
         created_at: rem.createdAt,
@@ -588,11 +659,117 @@ export async function buildSnapshot(
         tags_complete: false,
         detail_level: 'inventory',
         rich_text_fingerprint: `fnv1a64-json:${richFingerprint}`,
-        export_comparable_rich_text_fingerprint: `fnv1a64-canonical-richtext-v1:${comparableFingerprint}`,
+        export_comparable_rich_text_fingerprint: `fnv1a64-canonical-richtext-v2-media-url:${comparableFingerprint}`,
       },
     ];
   });
   const records = Object.fromEntries(recordEntries);
+  const maxChildMembershipProbes = 256 as const;
+  const expectedChildrenByParent = new Map<string, string[]>();
+  for (const rem of allRem) {
+    if (!rem.parent || !remById.has(rem.parent)) continue;
+    const children = expectedChildrenByParent.get(rem.parent) ?? [];
+    children.push(rem._id);
+    expectedChildrenByParent.set(rem.parent, children);
+  }
+  const childMembershipMismatchIds = allRem
+    .filter((rem) => {
+      const bulkIds = rem.children ?? [];
+      const expectedIds = expectedChildrenByParent.get(rem._id) ?? [];
+      const bulkSet = new Set(bulkIds);
+      const expectedSet = new Set(expectedIds);
+      return (
+        bulkSet.size !== bulkIds.length ||
+        expectedSet.size !== expectedIds.length ||
+        bulkSet.size !== expectedSet.size ||
+        [...bulkSet].some((id) => !expectedSet.has(id))
+      );
+    })
+    .map((rem) => rem._id);
+  const childMembershipProbeIds = childMembershipMismatchIds.slice(0, maxChildMembershipProbes);
+  const childMembershipSkippedIds = childMembershipMismatchIds.slice(maxChildMembershipProbes);
+  for (const id of childMembershipSkippedIds) records[id].child_ids_probe = 'limit-exceeded';
+  if (childMembershipSkippedIds.length > 0) {
+    addError({
+      severity: 'error',
+      scope: 'capture',
+      operation: 'Rem.getChildrenRem.probe-limit',
+      message: `Skipped ${childMembershipSkippedIds.length} of ${childMembershipMismatchIds.length} child-membership mismatch parent(s); the hard limit is ${maxChildMembershipProbes}.`,
+    });
+  }
+
+  let verifiedChildMembershipProbes = 0;
+  if (childMembershipProbeIds.length > 0) {
+    onProgress(
+      `Reconciling ${childMembershipProbeIds.length.toLocaleString()} bulk child-membership mismatch parent(s)…`,
+    );
+  }
+  await mapLimit(childMembershipProbeIds, 4, async (parentId) => {
+    throwIfAborted(options.signal);
+    const parent = remById.get(parentId)!;
+    const record = records[parentId];
+    if (typeof parent.getChildrenRem !== 'function') {
+      record.child_ids_probe = 'method-unavailable';
+      addError({
+        severity: 'error',
+        scope: 'record',
+        operation: 'Rem.getChildrenRem.unavailable',
+        rem_id: parentId,
+        message: 'Bulk children disagree with live parent pointers, and getChildrenRem is unavailable.',
+      });
+      return;
+    }
+    let returnedChildren: SnapshotRem[];
+    try {
+      returnedChildren = await parent.getChildrenRem();
+      throwIfAborted(options.signal);
+    } catch (error) {
+      rethrowAbort(error);
+      record.child_ids_probe = 'failed';
+      addError({
+        severity: 'error',
+        scope: 'record',
+        operation: 'Rem.getChildrenRem',
+        rem_id: parentId,
+        message: errorMessage(error),
+      });
+      return;
+    }
+
+    const returnedIds = returnedChildren.map((child) => child._id);
+    const returnedSet = new Set(returnedIds);
+    const expectedIds = expectedChildrenByParent.get(parentId) ?? [];
+    const expectedSet = new Set(expectedIds);
+    const returnedParentsAgree = returnedChildren.every(
+      (child) =>
+        child.parent === parentId &&
+        remById.get(child._id)?.parent === parentId,
+    );
+    const membershipConsistent =
+      returnedSet.size === returnedIds.length &&
+      returnedSet.size === expectedSet.size &&
+      [...returnedSet].every((id) => expectedSet.has(id)) &&
+      returnedParentsAgree;
+    if (!membershipConsistent) {
+      record.child_ids_probe = 'inconsistent';
+      addError({
+        severity: 'error',
+        scope: 'record',
+        operation: 'Rem.getChildrenRem.inconsistent',
+        rem_id: parentId,
+        message:
+          'getChildrenRem did not return a unique child set exactly matching the complete parent-pointer graph.',
+      });
+      return;
+    }
+    record.child_ids = returnedIds;
+    record.child_ids_source = 'getChildrenRem';
+    record.child_ids_probe = 'verified';
+    verifiedChildMembershipProbes += 1;
+  });
+  const childMembershipProbeComplete =
+    childMembershipSkippedIds.length === 0 &&
+    verifiedChildMembershipProbes === childMembershipProbeIds.length;
   const tagRelations: MigrationSnapshot['relations']['tags'] = {
     complete: false,
     ordered: false,
@@ -941,6 +1118,7 @@ export async function buildSnapshot(
     const candidateIds = allCandidateIds.slice(0, probeCount);
     remainingContextProbes -= probeCount;
     const visibilityStates: Record<string, HiddenState | 'unknown'> = {};
+    const rawVisibilityStates: Record<string, HiddenRuntimeValue> = {};
     const collapsedStates: Record<string, boolean> = {};
     const positionStates: PortalRecord['positions']['states'] = {};
     let visibilityComplete = membershipComplete && probeCount === allCandidateIds.length;
@@ -979,6 +1157,7 @@ export async function buildSnapshot(
         return {
           candidateId,
           hidden: undefined,
+          rawHidden: 'unknown' as const,
           hiddenFailed: false,
           hiddenInvalid: false,
           hiddenMethodUnavailable: false,
@@ -989,6 +1168,7 @@ export async function buildSnapshot(
         };
       }
       let hidden: HiddenState | undefined;
+      let rawHidden: HiddenRuntimeValue = 'unknown';
       let collapsed: boolean | undefined;
       let position: number | undefined;
       let visiblePosition: number | undefined;
@@ -997,28 +1177,35 @@ export async function buildSnapshot(
       const hiddenMethodUnavailable =
         typeof candidate.getHiddenExplicitlyIncludedState !== 'function';
       try {
-        const rawHidden: unknown = !hiddenMethodUnavailable
-          ? await candidate.getHiddenExplicitlyIncludedState?.(portal._id)
-          : undefined;
-        if (
-          rawHidden === 'hidden' ||
-          rawHidden === 'included' ||
-          rawHidden === 'none' ||
-          rawHidden === undefined
-        ) {
-          hidden = rawHidden;
-        } else {
-          hiddenInvalid = true;
-          portalErrorIds.push(
-            addError({
-              severity: 'error',
-              scope: 'portal',
-              operation: 'Rem.getHiddenExplicitlyIncludedState.runtime-value',
-              rem_id: candidateId,
-              portal_id: portal._id,
-              message: `Host returned an unsupported runtime value: ${JSON.stringify(rawHidden)}.`,
-            }),
-          );
+        if (!hiddenMethodUnavailable) {
+          const wireValue: unknown = await candidate.getHiddenExplicitlyIncludedState?.(portal._id);
+          if (wireValue === undefined) {
+            // The current host represents its NONE enum as undefined. This is distinct from
+            // an unavailable method, a rejected call, or an unresolved Rem.
+            rawHidden = 'undefined';
+            hidden = 'none';
+          } else if (
+            wireValue === 'hidden' ||
+            wireValue === 'included' ||
+            wireValue === 'root' ||
+            wireValue === 'tab_included' ||
+            wireValue === 'none'
+          ) {
+            rawHidden = wireValue;
+            hidden = wireValue;
+          } else {
+            hiddenInvalid = true;
+            portalErrorIds.push(
+              addError({
+                severity: 'error',
+                scope: 'portal',
+                operation: 'Rem.getHiddenExplicitlyIncludedState.runtime-value',
+                rem_id: candidateId,
+                portal_id: portal._id,
+                message: `Host returned an unsupported runtime value: ${JSON.stringify(wireValue)}.`,
+              }),
+            );
+          }
         }
         throwIfAborted(options.signal);
       } catch (error) {
@@ -1072,6 +1259,7 @@ export async function buildSnapshot(
       return {
         candidateId,
         hidden,
+        rawHidden,
         hiddenFailed,
         hiddenInvalid,
         hiddenMethodUnavailable,
@@ -1104,6 +1292,7 @@ export async function buildSnapshot(
         collapsedComplete = false;
         positionsComplete = false;
         visibilityStates[result.candidateId] = 'unknown';
+        rawVisibilityStates[result.candidateId] = 'unknown';
         portalErrorIds.push(
           addError({
             severity: 'error',
@@ -1119,6 +1308,7 @@ export async function buildSnapshot(
       if (result.hidden === undefined) {
         visibilityComplete = false;
         visibilityStates[result.candidateId] = 'unknown';
+        rawVisibilityStates[result.candidateId] = result.rawHidden;
         if (result.hiddenMethodUnavailable) {
           portalErrorIds.push(
             addError({
@@ -1131,20 +1321,24 @@ export async function buildSnapshot(
                 'The method exists in @remnote/plugin-sdk 0.0.46 types but is unavailable on this runtime Rem object.',
             }),
           );
-        } else if (!result.hiddenFailed && !result.hiddenInvalid) {
+        }
+      } else {
+        visibilityStates[result.candidateId] = result.hidden;
+        rawVisibilityStates[result.candidateId] = result.rawHidden;
+        if (result.hidden === 'tab_included') {
+          visibilityComplete = false;
           portalErrorIds.push(
             addError({
               severity: 'warning',
               scope: 'portal',
-              operation: 'Rem.getHiddenExplicitlyIncludedState',
+              operation: 'visibility-tab-included-unvalidated',
               rem_id: result.candidateId,
               portal_id: portal._id,
-              message: 'The typed-but-undocumented SDK method returned undefined.',
+              message:
+                'The host returned tab_included, whose migration visibility semantics have not been calibrated.',
             }),
           );
         }
-      } else {
-        visibilityStates[result.candidateId] = result.hidden;
       }
       if (result.collapsed === undefined) collapsedComplete = false;
       else collapsedStates[result.candidateId] = result.collapsed;
@@ -1158,6 +1352,79 @@ export async function buildSnapshot(
     }
 
     if (nestedContextUnresolved || searchContextDiscoveryIncomplete) visibilityComplete = false;
+
+    let rootResultIds: string[] | null = null;
+    let rootResultComplete = false;
+    const rootResultBlockers: string[] = [];
+    if (portalType === PORTAL_TYPE.SEARCH_PORTAL) {
+      if (!membershipComplete) rootResultBlockers.push('membership-incomplete');
+      if (nestedContextUnresolved) rootResultBlockers.push('nested-contexts-unresolved');
+      if (searchContextDiscoveryIncomplete) rootResultBlockers.push('context-discovery-incomplete');
+
+      const memberStates = memberIds.map((id) => visibilityStates[id] ?? 'unknown');
+      if (memberStates.includes('unknown')) rootResultBlockers.push('member-state-unknown');
+      if (memberStates.includes('tab_included')) {
+        rootResultBlockers.push('tab-included-semantics-unvalidated');
+      }
+
+      const rootIds = memberIds.filter((id) => visibilityStates[id] === 'root');
+      if (memberIds.length > 0 && rootIds.length === 0) {
+        rootResultBlockers.push('nonempty-membership-without-root');
+      }
+
+      const rootIdSet = new Set(rootIds);
+      const hasRootAncestor = (id: string): boolean => {
+        const seen = new Set<string>();
+        let cursor = runtimeRemById.get(id)?.parent ?? remById.get(id)?.parent ?? null;
+        while (cursor && !seen.has(cursor)) {
+          if (rootIdSet.has(cursor)) return true;
+          seen.add(cursor);
+          cursor = runtimeRemById.get(cursor)?.parent ?? remById.get(cursor)?.parent ?? null;
+        }
+        return false;
+      };
+      const unexplainedNonRoots = memberIds.filter(
+        (id) => !rootIdSet.has(id) && !hasRootAncestor(id),
+      );
+      if (unexplainedNonRoots.length > 0) {
+        rootResultBlockers.push('non-root-members-without-root-ancestor');
+      }
+
+      const positionedRoots = rootIds.map((id) => ({
+        id,
+        visiblePosition: positionStates[id]?.visible_position,
+      }));
+      if (
+        positionedRoots.some(
+          ({ visiblePosition }) =>
+            !Number.isInteger(visiblePosition) || (visiblePosition as number) < 0,
+        )
+      ) {
+        rootResultBlockers.push('root-visible-position-missing-or-invalid');
+      }
+      const rootPositions = positionedRoots.map(({ visiblePosition }) => visiblePosition);
+      if (new Set(rootPositions).size !== rootPositions.length) {
+        rootResultBlockers.push('root-visible-position-duplicate');
+      }
+
+      if (rootResultBlockers.length === 0) {
+        rootResultIds = positionedRoots
+          .slice()
+          .sort((left, right) => (left.visiblePosition as number) - (right.visiblePosition as number))
+          .map(({ id }) => id);
+        rootResultComplete = true;
+      } else {
+        portalErrorIds.push(
+          addError({
+            severity: 'error',
+            scope: 'portal',
+            operation: 'search-root-result-order',
+            portal_id: portal._id,
+            message: `Could not derive ordered top-level search results: ${rootResultBlockers.join(', ')}.`,
+          }),
+        );
+      }
+    }
 
     const orderValidated =
       portalType === PORTAL_TYPE.PORTAL
@@ -1187,7 +1454,7 @@ export async function buildSnapshot(
       (result) => !result.hiddenInvalid && !result.hiddenMethodUnavailable,
     );
     const visibilitySemanticsValidated = options.visibilitySemanticsValidated === true;
-    const portalMigrationComplete =
+    let portalMigrationComplete =
       membershipComplete &&
       orderValidated &&
       visibilityComplete &&
@@ -1202,13 +1469,16 @@ export async function buildSnapshot(
       let filter: RichTextInterface | null = null;
       let dontIncludeNested: RichTextInterface | null = null;
       let automaticViewComplete =
-        membershipComplete && !nestedContextUnresolved && !searchContextDiscoveryIncomplete;
+        membershipComplete &&
+        rootResultComplete &&
+        !nestedContextUnresolved &&
+        !searchContextDiscoveryIncomplete;
       for (const [operation, slot, setter] of [
-        ['SearchPortal.Query', 'q', (value: RichTextInterface) => (query = cloneRichText(value))],
-        ['SearchPortal.Filter', 'f', (value: RichTextInterface) => (filter = cloneRichText(value))],
+        ['SearchPortal.Query', 'Query', (value: RichTextInterface) => (query = cloneRichText(value))],
+        ['SearchPortal.Filter', 'Filter', (value: RichTextInterface) => (filter = cloneRichText(value))],
         [
           'SearchPortal.DontIncludeNestedDescendants',
-          's',
+          'DontIncludeNestedDescendants',
           (value: RichTextInterface) => (dontIncludeNested = cloneRichText(value)),
         ],
       ] as const) {
@@ -1230,7 +1500,10 @@ export async function buildSnapshot(
         }
       }
       try {
-        backlinkTarget = await portal.getPowerupPropertyAsRem('sp', 'b');
+        backlinkTarget = await portal.getPowerupPropertyAsRem(
+          'sp',
+          'AutomaticBacklinkSearchPortalFor',
+        );
         if (backlinkTarget) {
           rememberRuntimeRem(backlinkTarget, `portal:${portal._id}:backlink-target`);
         }
@@ -1259,12 +1532,16 @@ export async function buildSnapshot(
           : searchContextDiscoveryIncomplete
             ? 'direct-members-context-discovery-incomplete'
             : 'direct-members',
+        root_result_ids: rootResultIds,
+        root_result_complete: rootResultComplete,
+        root_result_order: rootResultComplete ? 'visible-sibling-position' : null,
+        root_result_blockers: rootResultBlockers,
         backlink_target_id: backlinkTarget?._id ?? null,
         query,
         filter,
         dont_include_nested_descendants: dontIncludeNested,
         limitation:
-          'The SDK exposes live portal members and the backlink target slot, but no documented discriminator for tag views or guarantee that result order matches every UI section.',
+          'result_ids preserves SDK return order for diagnostics. root_result_ids is emitted only when every top-level root is identified by the host root state and has a unique nonnegative visible sibling position; nested contexts remain unresolved.',
       };
 
       if (backlinkTarget && !(backlinkTarget._id in backlinkRelations)) {
@@ -1299,6 +1576,10 @@ export async function buildSnapshot(
           );
         }
       }
+    }
+
+    if (portalType === PORTAL_TYPE.SEARCH_PORTAL) {
+      portalMigrationComplete = portalMigrationComplete && automaticView?.complete === true;
     }
 
     const candidateResultById = new Map(
@@ -1336,6 +1617,13 @@ export async function buildSnapshot(
         sdk_status: 'typed-but-undocumented',
         candidate_ids: candidateIds,
         states: visibilityStates,
+        raw_states: rawVisibilityStates,
+        runtime_contract: {
+          source: 'public-host-implementation-and-live-calibration',
+          sdk_declaration_complete: false,
+          resolved_undefined_means: 'none',
+          tab_included_projection: 'unvalidated',
+        },
         runtime_values_valid: runtimeValuesValid,
         semantics_validation: visibilitySemanticsValidated
           ? 'operator-ui-validated'
@@ -1396,18 +1684,27 @@ export async function buildSnapshot(
     for (const id of memberIds.slice(0, maxDetailedMembersPerPortal)) detailedIds.add(id);
     if (automaticView?.backlink_target_id) detailedIds.add(automaticView.backlink_target_id);
 
+    const projectionMembers =
+      portalType === PORTAL_TYPE.SEARCH_PORTAL
+        ? automaticView?.complete && automaticView.root_result_ids
+          ? automaticView.root_result_ids
+          : null
+        : memberIds;
     if (
       membershipComplete &&
       orderValidated &&
       !nestedContextUnresolved &&
       !searchContextDiscoveryIncomplete &&
+      projectionMembers !== null &&
       (portalType === PORTAL_TYPE.PORTAL || portalType === PORTAL_TYPE.SEARCH_PORTAL)
     ) {
       converterProjection.portal_snapshots[portal._id] = {
         evidence: `RemNote SDK Rem.getPortalDirectlyIncludedRem captured ${captureTime}; ${
-          portalType === PORTAL_TYPE.SEARCH_PORTAL ? 'search portal live result' : 'portal membership'
+          portalType === PORTAL_TYPE.SEARCH_PORTAL
+            ? 'host root state ordered by visible sibling position'
+            : 'portal membership order'
         } order`,
-        members: [...memberIds],
+        members: [...projectionMembers],
       };
     }
     if (visibilityComplete && runtimeValuesValid && visibilitySemanticsValidated) {
@@ -1418,7 +1715,7 @@ export async function buildSnapshot(
       );
       if (Object.keys(explicitStates).length) {
         converterProjection.visibility_overrides[portal._id] = {
-          evidence: `RemNote SDK Rem.getHiddenExplicitlyIncludedState captured ${captureTime}; runtime tri-state and semantics operator-validated; hidden/included projected, none retained only in full contract as no local override`,
+          evidence: `RemNote SDK Rem.getHiddenExplicitlyIncludedState captured ${captureTime}; runtime state semantics operator-validated; hidden/included projected, other states retained only in the full contract`,
           states: explicitStates,
         };
       }
@@ -1470,7 +1767,9 @@ export async function buildSnapshot(
     errors.every((error) => error.severity !== 'error') &&
     Object.values(portals).every((portal) => portal.migration.complete);
   const diagnosticsComplete =
-    portalScopeComplete && Object.values(portals).every((portal) => portal.diagnostics.complete);
+    childMembershipProbeComplete &&
+    portalScopeComplete &&
+    Object.values(portals).every((portal) => portal.diagnostics.complete);
 
   const completedAt = new Date().toISOString();
   const snapshot: MigrationSnapshot = {
@@ -1495,6 +1794,7 @@ export async function buildSnapshot(
         max_context_probes: maxContextProbes,
         max_probes_per_portal: maxProbesPerPortal,
         max_detailed_members_per_portal: maxDetailedMembersPerPortal,
+        max_child_membership_probes: maxChildMembershipProbes,
       },
       scope: {
         expected_portal_count: expectedPortalCount,
@@ -1507,19 +1807,34 @@ export async function buildSnapshot(
         search_order_validated: options.searchOrderValidated === true,
         visibility_semantics_validated: options.visibilitySemanticsValidated === true,
         reason:
-          'A portal membership projection is emitted only for a portal type whose SDK return order was compared with the live UI. Visibility projection requires complete runtime-valid tri-state results plus operator UI validation; none remains only in the full contract as no local override.',
+          'Ordinary portal projection requires validated SDK membership order. Search projection uses host root states sorted by unique nonnegative visible sibling positions and remains blocked for nested contexts or unaccounted members. Visibility projection requires complete runtime-valid state results plus operator UI validation.',
       },
       export_comparison: {
         structural_fields: ['id', 'parent_id', 'child_ids'],
         child_order_calibrated: options.childOrderCalibrated === true,
         child_order_raw_basis:
-          'Compare SDK children array order with raw siblings sorted by fractional f, using raw record ordinal as the tie-break.',
-        rich_text_algorithm: 'fnv1a64-canonical-richtext-v1',
+          'Raw siblings use null-first fractional f; every SDK child array must have complete parent-consistent membership; SDK order resolves null/tied f.',
+        child_membership_probe: {
+          complete: childMembershipProbeComplete,
+          mismatch_parent_count: childMembershipMismatchIds.length,
+          attempted: childMembershipProbeIds.length,
+          verified: verifiedChildMembershipProbes,
+          failed: childMembershipProbeIds.length - verifiedChildMembershipProbes,
+          skipped_by_limit: childMembershipSkippedIds.length,
+          method: 'Rem.getChildrenRem',
+        },
+        rich_text_algorithm: 'fnv1a64-canonical-richtext-v2-media-url',
+        media_url_normalization: {
+          scope: 'rich-text-media-object-url-only',
+          media_type: 'i',
+          prefixes: ['https://remnote-user-data.s3.amazonaws.com/', '%LOCAL_FILE%'],
+          sentinel: '%REMNOTE_ASSET%',
+        },
         raw_input_fields: ['key', 'value'],
         sdk_input_fields: ['text', 'backText'],
         calibrated_equivalent: options.richTextFingerprintCalibrated === true,
         limitation:
-          'The canonical rich-text digest is a hard drift gate only after a real record sample proves raw key/value and SDK text/backText are representation-equivalent.',
+          'The canonical rich-text digest normalizes only recognized RemNote asset prefixes in media-object url fields. It is a hard drift gate only when calibrated_equivalent is true.',
       },
       provenance: {
         producer: 'PKMigrator Read-Only Snapshot',
